@@ -35,7 +35,7 @@ Write-host "AssignmentGroup: $($AADGroup.displayName)"
 }
 
 
-Write-host "AssignmentTypes: $($Payload.assignmentFilterType)"
+Write-host "    Types: $($Payload.assignmentFilterType)"
 
 }
 }

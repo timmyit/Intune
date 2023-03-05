@@ -1,0 +1,43 @@
+Install-Module -Name Microsoft.Graph.Intune -Force
+
+Connect-MSGraph -ForceInteractive
+
+$Resource = "deviceManagement/assignmentFilters"
+$graphApiVersion = "Beta"
+$uri = "https://graph.microsoft.com/$graphApiVersion/$($resource)"
+ 
+ 
+$Response = Invoke-MSGraphRequest -HttpMethod GET -Url $uri 
+
+$Filters = $Response.value
+
+Foreach ($Filter in $Filters) {
+
+$Payloads = Invoke-MSGraphRequest -HttpMethod GET -Url "https://graph.microsoft.com/beta/deviceManagement/assignmentFilters/$($Filter.id)/payloads"
+
+Write-host "Name: $($Filter.displayName)"
+Write-host "Platform: $($Filter.platform)"
+Write-host "Assignments: $($Payloads.value.Count)"
+
+if ($payloads -ne $null) {
+Foreach ($Payload in $Payloads.value) {
+if ($Payload.groupId -like "acacacac-9df4-4c7d-9d50-4ef0226f57a9" -or $Payload.groupId -like "adadadad-808e-44e2-905a-0b7873a8a531") {
+
+    if ($Payload.groupId -like "acacacac-9df4-4c7d-9d50-4ef0226f57a9")
+    {Write-host "AssignmentGroup: All Users (Built-in Group)"}
+    if ($Payload.groupId -like "adadadad-808e-44e2-905a-0b7873a8a531")
+    {Write-host "AssignmentGroup: All Devices (Built-in Group)"}
+
+}
+Else {
+$AADGroup = Get-AADGroup -groupId $Payload.groupId -ErrorAction SilentlyContinue
+Write-host "AssignmentGroup: $($AADGroup.displayName)"
+}
+
+
+Write-host "AssignmentTypes: $($Payload.assignmentFilterType)"
+
+}
+}
+Write-host "---------------"
+}

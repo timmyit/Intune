@@ -7,9 +7,8 @@ Connect-MgGraph -scopes Group.Read.All, DeviceManagementManagedDevices.Read.All,
 
 
 ### Get Azure AD Group
-$groupName = "All - Android Enterprise"
 $groupName = "All-Windows"
-$groupName = "Test-Policies"
+
 
 $Group = Get-MgGroup -Filter "DisplayName eq '$groupName'"
 ### Device Compliance Policy

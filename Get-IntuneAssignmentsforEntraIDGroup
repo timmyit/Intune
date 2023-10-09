@@ -149,4 +149,23 @@ $SCRIPTAS = (Invoke-MgGraphRequest -Method GET -Uri "https://graph.microsoft.com
 
 }
 
+### Windows Autopilot profiles
+
+$Resource = "deviceManagement/windowsAutopilotDeploymentProfiles"
+$graphApiVersion = "Beta"
+$uri = "https://graph.microsoft.com/$graphApiVersion/$($Resource)?`$expand=Assignments"
+$Response = Invoke-MgGraphRequest -Method GET -Uri $uri
+$AllObjects = $Response.value
+Write-host "Following Autopilot Profiles has been assigned to: $($Group.DisplayName)" -ForegroundColor cyan
+
+foreach ($Script in $AllObjects) {
+  
+$APProfile = (Invoke-MgGraphRequest -Method GET -Uri "https://graph.microsoft.com/beta/deviceManagement/windowsAutopilotDeploymentProfiles/$($Script.Id)/assignments").value 
+
+  if ($APProfile.target.groupId -match $Group.Id) {
+  Write-host "$($Script.DisplayName)" -ForegroundColor Yellow
+  }
+
+}
+
 Disconnect-Graph

@@ -24,9 +24,9 @@ Write-host "$($App.DisplayName)" -ForegroundColor Yellow
  if ($App.assignments.id -like "acacacac-9df4-4c7d-9d50-4ef0226f57a9*" -or $App.assignments.id -like "adadadad-808e-44e2-905a-0b7873a8a531*") {
  
     if ($App.assignments.id -like "acacacac-9df4-4c7d-9d50-4ef0226f57a9*")
-    {Write-host "Assigned as $($App.assignments.intent) to Entra ID Group: All Users (Built-in Group)"}
+    {Write-host "Assigned as $($App.assignments.intent) ---- EntraID Group: All Users (Built-in Group)"}
     if ($App.assignments.id -like "adadadad-808e-44e2-905a-0b7873a8a531*")
-    {Write-host "Assigned as $($App.assignments.intent) to Entra ID Group: All Devices (Built-in Group)"}
+    {Write-host "Assigned as $($App.assignments.intent) ---- EntraID Group: All Devices (Built-in Group)"}
  
 }
 Else {
@@ -39,11 +39,10 @@ foreach ($group in $EIDGroupId) {
 $EIdGroup = Get-MgGroup -Filter "Id eq '$group'" -ErrorAction Continue
 $AssignIntent = $App.assignments | Where-Object -Property id -like "$group*"
 
-Write-host "Assigned as $($AssignIntent.intent) to Entra ID Group: $($EIdGroup.displayName)"
+Write-host "Assigned as $($AssignIntent.intent) ---- EntraID Group: $($EIdGroup.displayName)"
 
 }
 }
 }
 Write-host "End Script output -----------------" -ForegroundColor Cyan
 Write-host "Total apps: $($apps.count)" -ForegroundColor Cyan
-

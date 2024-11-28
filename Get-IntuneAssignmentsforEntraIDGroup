@@ -1,170 +1,136 @@
-Install-Module -Name Microsoft.Graph.DeviceManagement -Force -AllowClobber
-Install-Module -Name Microsoft.Graph.Groups -Force -AllowClobber
-Import-Module -Name Microsoft.Graph.Groups
-Import-Module -Name Microsoft.Graph.DeviceManagement
+#requires -Modules Microsoft.Graph.DeviceManagement,Microsoft.Graph.Groups
 
-Connect-MgGraph -scopes Group.Read.All, DeviceManagementManagedDevices.Read.All, DeviceManagementServiceConfig.Read.All, DeviceManagementApps.Read.All, DeviceManagementApps.Read.All, DeviceManagementConfiguration.Read.All, DeviceManagementConfiguration.ReadWrite.All, DeviceManagementApps.ReadWrite.All
+Connect-MgGraph -Scopes Group.Read.All, DeviceManagementManagedDevices.Read.All, DeviceManagementServiceConfig.Read.All, DeviceManagementApps.Read.All -NoWelcome
 
+#Group Name
+$groupName = 'All-Windows'
+
+#Graph API version
+$graphApiVersion = 'Beta'
 
 ### Get Azure AD Group
-$groupName = "All-Windows"
+$group = Get-MgGroup -Filter "DisplayName eq '$groupName'"
 
-
-$Group = Get-MgGroup -Filter "DisplayName eq '$groupName'"
-### Device Compliance Policy
-
-$Resource = "deviceManagement/deviceCompliancePolicies"
-$graphApiVersion = "Beta"
+# Applications
+$resource = 'deviceAppManagement/mobileApps'
 $uri = "https://graph.microsoft.com/$graphApiVersion/$($Resource)?`$expand=Assignments"
-$AllDCPId = (Invoke-MgGraphRequest -Method GET -Uri $uri).Value | Where-Object {$_.assignments.target.groupId -match $Group.id}
+$applicationAssignments = (Invoke-MgGraphRequest -Method GET -Uri $uri).Value | Where-Object { $_.assignments.target.groupId -match $group.id }
 
-Write-host "The following Device Compliance Policies has been assigned to: $($Group.DisplayName)" -ForegroundColor Cyan
+Write-Host "The following applications have been assigned to: $($group.DisplayName)" -ForegroundColor Cyan
 
-foreach ($DCPId in $AllDCPId) {
-
-  Write-host "$($DCPId.DisplayName)" -ForegroundColor Yellow
-}
- # Applications 
-
-$Resource = "deviceAppManagement/mobileApps"
-$graphApiVersion = "Beta"
-$uri = "https://graph.microsoft.com/$graphApiVersion/$($Resource)?`$expand=Assignments"
-$Apps = (Invoke-MgGraphRequest -Method GET -Uri $uri).Value | Where-Object {$_.assignments.target.groupId -match $Group.id}
-
-Write-host "Following Apps has been assigned to: $($Group.DisplayName)" -ForegroundColor cyan
- 
-foreach ($App in $Apps) {
-
-  Write-host "$($App.DisplayName)" -ForegroundColor Yellow
-  
-
+foreach ($assignment in $applicationAssignments) {
+    Write-Host "$($assignment.DisplayName)" -ForegroundColor Yellow
 }
 
- # Application Configurations (App Configs)
+# Application Configurations (App Configs)
+$resource = 'deviceAppManagement/targetedManagedAppConfigurations'
+$uri = "https://graph.microsoft.com/$graphApiVersion/$($resource)?`$expand=Assignments"
+$applicationConfigurationAssignments = (Invoke-MgGraphRequest -Method GET -Uri $uri).Value | Where-Object { $_.assignments.target.groupId -match $group.id }
 
+Write-Host "The following App Configurations have been assigned to: $($group.DisplayName)" -ForegroundColor Cyan
 
-$Resource = "deviceAppManagement/targetedManagedAppConfigurations"
-$graphApiVersion = "Beta"
-$uri = "https://graph.microsoft.com/$graphApiVersion/$($Resource)?`$expand=Assignments"
-$AppConfigs = (Invoke-MgGraphRequest -Method GET -Uri $uri).Value | Where-Object {$_.assignments.target.groupId -match $Group.id}
-
-Write-host "Following App Configuration has been assigned to: $($Group.DisplayName)" -ForegroundColor cyan
- 
-foreach ($AppConfig in $AppConfigs) {
-
-  Write-host "$($AppConfig.DisplayName)" -ForegroundColor Yellow
-  
-
+foreach ($assignment in $applicationConfigurationAssignments) {
+    Write-Host "$($assignment.DisplayName)" -ForegroundColor Yellow
 }
 
 ## App protection policies
-
-
-$AppProtURIs = @{
-    iosManagedAppProtections = "https://graph.microsoft.com/beta/deviceAppManagement/iosManagedAppProtections?`$expand=Assignments"
-    androidManagedAppProtections = "https://graph.microsoft.com/beta/deviceAppManagement/androidManagedAppProtections?`$expand=Assignments"
-    windowsManagedAppProtections = "https://graph.microsoft.com/beta/deviceAppManagement/windowsManagedAppProtections?`$expand=Assignments"
-    mdmWindowsInformationProtectionPolicies = "https://graph.microsoft.com/beta/deviceAppManagement/mdmWindowsInformationProtectionPolicies?`$expand=Assignments"
-  }
-
-
-$graphApiVersion = "Beta"
-
-$AllAppProt = $null
-foreach ($url in $AppProtURIs.GetEnumerator()) {
-
-
- $AllAppProt = (Invoke-MgGraphRequest -Method GET -Uri $url.value).Value | Where-Object {$_.assignments.target.groupId -match $Group.id} -ErrorAction SilentlyContinue
-  Write-host "Following App Protection / "$($url.name)" has been assigned to: $($Group.DisplayName)" -ForegroundColor cyan
-  foreach ($AppProt in $AllAppProt) {
-
-    Write-host "$($AppProt.DisplayName)" -ForegroundColor Yellow
-     
-  }
-  } 
-
-# Device Configuration
-
-$DCURIs = @{
-    ConfigurationPolicies = "https://graph.microsoft.com/beta/deviceManagement/configurationPolicies?`$expand=Assignments"
-    DeviceConfigurations = "https://graph.microsoft.com/beta/deviceManagement/deviceConfigurations?`$expand=Assignments"
-    GroupPolicyConfigurations = "https://graph.microsoft.com/beta/deviceManagement/groupPolicyConfigurations?`$expand=Assignments"
-    mobileAppConfigurations = "https://graph.microsoft.com/beta/deviceAppManagement/mobileAppConfigurations?`$expand=Assignments"
-  }
-  
-$AllDC = $null
-foreach ($url in $DCURIs.GetEnumerator()) {
-
-
-  $AllDC = (Invoke-MgGraphRequest -Method GET -Uri $url.value).Value | Where-Object {$_.assignments.target.groupId -match $Group.id} -ErrorAction SilentlyContinue
-  Write-host "Following Device Configuration / "$($url.name)" has been assigned to: $($Group.DisplayName)" -ForegroundColor cyan
-  foreach ($DCs in $AllDC) {
-
-    #If statement because ConfigurationPolicies does not contain DisplayName. 
-      if ($($DCs.displayName -ne $null)) { 
-      
-      Write-host "$($DCs.DisplayName)" -ForegroundColor Yellow
-      } 
-      else {
-        Write-host "$($DCs.Name)" -ForegroundColor Yellow
-      } 
-  }
-  } 
-
-### Remediation scripts 
-
-$uri = "https://graph.microsoft.com/beta/deviceManagement/deviceHealthScripts"
-$REMSC = Invoke-MgGraphRequest -Method GET -Uri $uri
-$AllREMSC = $REMSC.value 
-Write-host "Following Remediation Script has been assigned to: $($Group.DisplayName)" -ForegroundColor cyan
- 
-foreach ($Script in $AllREMSC) {
-
-$SCRIPTAS = (Invoke-MgGraphRequest -Method GET -Uri "https://graph.microsoft.com/beta/deviceManagement/deviceHealthScripts/$($Script.Id)/assignments").value 
-
-  if ($SCRIPTAS.target.groupId -match $Group.Id) {
-  Write-host "$($Script.DisplayName)" -ForegroundColor Yellow
-  }
-
+$applicationProtectionEndpoints = @{
+    iosManagedAppProtections                = 'deviceAppManagement/iosManagedAppProtections'
+    androidManagedAppProtections            = 'deviceAppManagement/androidManagedAppProtections'
+    windowsManagedAppProtections            = 'deviceAppManagement/windowsManagedAppProtections'
+    mdmWindowsInformationProtectionPolicies = 'deviceAppManagement/mdmWindowsInformationProtectionPolicies'
 }
 
+foreach ($endpoint in $applicationProtectionEndpoints.GetEnumerator()) {
+    $applicationProtectionAssignments = (Invoke-MgGraphRequest -Method GET -Uri "https://graph.microsoft.com/beta/$($endpoint.Value)?`$expand=Assignments").Value | Where-Object { $_.assignments.target.groupId -match $group.id }
 
-### Platform Scrips / Device Management 
+    Write-Host 'The following App Protection / '$($endpoint.Value)" have been assigned to: $($group.DisplayName)" -ForegroundColor Cyan
 
-$Resource = "deviceManagement/deviceManagementScripts"
-$graphApiVersion = "Beta"
-$uri = "https://graph.microsoft.com/beta/deviceManagement/deviceManagementScripts"
-$PSSC = Invoke-MgGraphRequest -Method GET -Uri $uri
-$AllPSSC = $PSSC.value
-Write-host "Following Platform Scripts / Device Management scripts has been assigned to: $($Group.DisplayName)" -ForegroundColor cyan
+    foreach ($assignment in $applicationProtectionAssignments) {
+        Write-Host "$($assignment.DisplayName)" -ForegroundColor Yellow
+    }
+}
 
-foreach ($Script in $AllPSSC) {
-  
-$SCRIPTAS = (Invoke-MgGraphRequest -Method GET -Uri "https://graph.microsoft.com/beta/deviceManagement/deviceManagementScripts/$($Script.Id)/assignments").value 
+### Device Compliance Policy
+$resource = 'deviceManagement/deviceCompliancePolicies'
+$uri = "https://graph.microsoft.com/$graphApiVersion/$($resource)?`$expand=Assignments"
+$deviceComplianceAssignments = (Invoke-MgGraphRequest -Method GET -Uri $uri).Value | Where-Object { $_.assignments.target.groupId -match $Group.id }
 
-  if ($SCRIPTAS.target.groupId -match $Group.Id) {
-  Write-host "$($Script.DisplayName)" -ForegroundColor Yellow
-  }
+Write-Host "The following Device Compliance Policies have been assigned to: $($Group.DisplayName)" -ForegroundColor Cyan
 
+foreach ($assignment in $deviceComplianceAssignments) {
+    Write-Host "$($assignment.DisplayName)" -ForegroundColor Yellow
+}
+
+# Device Configuration
+$deviceConfigurationEndpoints = @{
+    ConfigurationPolicies     = 'deviceManagement/configurationPolicies'
+    DeviceConfigurations      = 'deviceManagement/deviceConfigurations'
+    GroupPolicyConfigurations = 'deviceManagement/groupPolicyConfigurations'
+    MobileAppConfigurations   = 'deviceAppManagement/mobileAppConfigurations'
+}
+
+foreach ($endpoint in $deviceConfigurationEndpoints.GetEnumerator()) {
+    $uri = "https://graph.microsoft.com/$graphApiVersion/$($endpoint.Value)?`$expand=Assignments"
+
+    $deviceConfigurationAssignments = (Invoke-MgGraphRequest -Method GET -Uri $uri).Value | Where-Object { $_.assignments.target.groupId -match $Group.id }
+
+    Write-Host 'The following Device Configuration / '$($endpoint.Value)" have been assigned to: $($Group.DisplayName)" -ForegroundColor Cyan
+
+    foreach ($assignment in $deviceConfigurationAssignments) {
+        if ($($null -ne $assignment.displayName)) {
+            Write-Host "$($assignment.DisplayName)" -ForegroundColor Yellow
+        }
+
+        else {
+            Write-Host "$($assignment.Name)" -ForegroundColor Yellow
+        }
+    }
+}
+
+### Platform Scrips / Device Management
+$resource = 'deviceManagement/deviceManagementScripts'
+$uri = "https://graph.microsoft.com/$graphApiVersion/$($resource)"
+$allPlatformScripts = Invoke-MgGraphRequest -Method GET -Uri $uri
+
+Write-Host "The following Platform Scripts / Device Management scripts have been assigned to: $($group.DisplayName)" -ForegroundColor cyan
+
+foreach ($script in $allPlatformScripts) {
+    $scriptAssignments = (Invoke-MgGraphRequest -Method GET -Uri "https://graph.microsoft.com/beta/deviceManagement/deviceManagementScripts/$($script.Id)?`$expand=assignments").Value | Where-Object { $_.assignments.target.groupId -match $group.id }
+
+    foreach ($assignment in $scriptAssignments) {
+        Write-Host "$($assignment.DisplayName)" -ForegroundColor Yellow
+    }
+}
+
+### Remediation scripts
+$uri = 'https://graph.microsoft.com/beta/deviceManagement/deviceHealthScripts'
+$allRemediationScripts = Invoke-MgGraphRequest -Method GET -Uri $uri
+
+Write-Host "The following Remediation Scripts have been assigned to: $($group.DisplayName)" -ForegroundColor Cyan
+
+foreach ($script in $allRemediationScripts) {
+    $scriptAssignments = (Invoke-MgGraphRequest -Method GET -Uri "https://graph.microsoft.com/beta/deviceManagement/deviceHealthScripts/$($script.Id)?`$expand=Assignments").Value | Where-Object { $_.assignments.target.groupId -match $group.id }
+
+    foreach ($assignment in $scriptAssignments) {
+        Write-Host "$($assignment.DisplayName)" -ForegroundColor Yellow
+    }
 }
 
 ### Windows Autopilot profiles
+$resource = 'deviceManagement/windowsAutopilotDeploymentProfiles'
+$uri = "https://graph.microsoft.com/$graphApiVersion/$($resource)"
+$allWindowsAutoPilotProfiles = Invoke-MgGraphRequest -Method GET -Uri $uri
 
-$Resource = "deviceManagement/windowsAutopilotDeploymentProfiles"
-$graphApiVersion = "Beta"
-$uri = "https://graph.microsoft.com/$graphApiVersion/$($Resource)?`$expand=Assignments"
-$Response = Invoke-MgGraphRequest -Method GET -Uri $uri
-$AllObjects = $Response.value
-Write-host "Following Autopilot Profiles has been assigned to: $($Group.DisplayName)" -ForegroundColor cyan
+Write-Host "Following Autopilot Profiles have been assigned to: $($group.DisplayName)" -ForegroundColor Cyan
 
-foreach ($Script in $AllObjects) {
-  
-$APProfile = (Invoke-MgGraphRequest -Method GET -Uri "https://graph.microsoft.com/beta/deviceManagement/windowsAutopilotDeploymentProfiles/$($Script.Id)/assignments").value 
+foreach ($profile in $allWindowsAutoPilotProfiles) {
 
-  if ($APProfile.target.groupId -match $Group.Id) {
-  Write-host "$($Script.DisplayName)" -ForegroundColor Yellow
-  }
+    $windowsAutoPilotProfileAssignments = (Invoke-MgGraphRequest -Method GET -Uri "https://graph.microsoft.com/beta/deviceManagement/windowsAutopilotDeploymentProfiles/$($profile.Id)?`$expand=Assignments").value | Where-Object { $_.target.groupId -match $group.id }
 
+    foreach ($assignment in $windowsAutoPilotProfileAssignments) {
+        Write-Host "$($assignment.DisplayName)" -ForegroundColor Yellow
+    }
 }
 
-Disconnect-Graph
+Disconnect-MgGraph

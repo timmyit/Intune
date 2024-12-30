@@ -10,7 +10,7 @@ Connect-MgGraph -scopes Group.Read.All, DeviceManagementManagedDevices.Read.All,
 
 $Resource = "deviceAppManagement/mobileApps"
 $graphApiVersion = "Beta"
-$uri = "https://graph.microsoft.com/$graphApiVersion/$($Resource)?`$filter=(isof('microsoft.graph.win32LobApp')) and (isAssigned eq true)&`$expand=Assignments"
+$uri = "https://graph.microsoft.com/$graphApiVersion/$($Resource)?`$filter=(isAssigned eq true)&`$expand=Assignments"
 
 
 $Apps = (Invoke-MgGraphRequest -Method GET -Uri $uri).Value | Where-Object {$_.assignments.intent -like "required"}

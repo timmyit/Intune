@@ -1,170 +1,2628 @@
-Install-Module -Name Microsoft.Graph.DeviceManagement -Force -AllowClobber
-Install-Module -Name Microsoft.Graph.Groups -Force -AllowClobber
-Import-Module -Name Microsoft.Graph.Groups
-Import-Module -Name Microsoft.Graph.DeviceManagement
+<#
+.SYNOPSIS
+    Generates a report of Intune assignments for a specified security group.
 
-Connect-MgGraph -scopes Group.Read.All, DeviceManagementManagedDevices.Read.All, DeviceManagementServiceConfig.Read.All, DeviceManagementApps.Read.All, DeviceManagementApps.Read.All, DeviceManagementConfiguration.Read.All, DeviceManagementConfiguration.ReadWrite.All, DeviceManagementApps.ReadWrite.All
+.DESCRIPTION
+    This script retrieves and reports on Intune policy and application assignments for a specified
+    security group. It connects to Microsoft Graph, allows the user to select which
+    types of assignments to check, and generates a formatted HTML report.
 
+    The script can report on the following assignment types:
+    - Applications
+    - Application Configurations
+    - Application Protection Policies
+    - Device Compliance Policies
+    - Device Configuration Policies
+    - Platform Scripts (Run Once Scripts)
+    - Remediation Scripts
+    - Windows AutoPilot Profiles
 
-### Get Azure AD Group
-$groupName = "All-Windows"
+.PARAMETER HtmlSavePath
+    The folder path where the HTML report will be saved.
+    If not specified, the report is saved to the user's TEMP directory.
 
+.EXAMPLE
+    PS C:\> .\Get-IntuneAssignmentReportForGroup.ps1
 
-$Group = Get-MgGroup -Filter "DisplayName eq '$groupName'"
-### Device Compliance Policy
+    Launches a selection dialog for the group name and assignment types, then generates
+    an HTML report saved to the default TEMP directory.
 
-$Resource = "deviceManagement/deviceCompliancePolicies"
-$graphApiVersion = "Beta"
-$uri = "https://graph.microsoft.com/$graphApiVersion/$($Resource)?`$expand=Assignments"
-$AllDCPId = (Invoke-MgGraphRequest -Method GET -Uri $uri).Value | Where-Object {$_.assignments.target.groupId -match $Group.id}
+.EXAMPLE
+    PS C:\> .\Get-IntuneAssignmentReportForGroup.ps1 -HtmlSavePath "C:\Reports"
 
-Write-host "The following Device Compliance Policies has been assigned to: $($Group.DisplayName)" -ForegroundColor Cyan
+    Launches a selection dialog for the group name and assignment types, then generates
+    an HTML report saved to the C:\Reports directory.
 
-foreach ($DCPId in $AllDCPId) {
+.NOTES
+    Author          : Systems Administration Team
+    Required Modules:
+        - Microsoft.Graph.Authentication
+        - Microsoft.Graph.Groups
+        - Microsoft.Graph.DeviceManagement
 
-  Write-host "$($DCPId.DisplayName)" -ForegroundColor Yellow
+    Required Graph API Permissions:
+        - Group.Read.All
+        - DeviceManagementManagedDevices.Read.All
+        - DeviceManagementServiceConfig.Read.All
+        - DeviceManagementApps.Read.All,
+        - DeviceManagementConfiguration.Read.All
+
+#>
+
+#requires -Modules @{ModuleName="Microsoft.Graph.Authentication"; ModuleVersion="1.20.0"}
+#requires -Modules @{ModuleName="Microsoft.Graph.DeviceManagement"; ModuleVersion="1.20.0"}
+#requires -Modules @{ModuleName="Microsoft.Graph.Groups"; ModuleVersion="1.20.0"}
+
+[CmdletBinding()]
+[OutputType([System.Void])]
+param (
+    [Parameter(Mandatory = $false)]
+    [string]
+    $HtmlSavePath = "$env:TEMP"
+)
+
+function Get-IntuneApplicationAssignments {
+    <#
+    .SYNOPSIS
+        Retrieves applications assigned to a specific security group in Intune.
+
+    .DESCRIPTION
+        This function uses Microsoft Graph API to retrieve all mobile applications that are
+        assigned to the specified security group in Microsoft Intune. It returns a list of
+        application objects with their display names and last modified dates.
+
+        The function handles three potential scenarios:
+        1. Applications are assigned to the group - returns details for each assigned application
+        2. No applications are assigned to the group - returns a single "No applications assigned" object
+        3. Error during retrieval - returns an error object with Status property set to 'Error'
+
+        This structured approach ensures the HTML report generation can continue even if
+        certain policy types encounter retrieval issues.
+
+    .PARAMETER Group
+        The security group object for which to retrieve assigned applications.
+        Must be an object of type Microsoft.Graph.PowerShell.Models.MicrosoftGraphGroup.
+
+    .EXAMPLE
+        $group = Get-MgGroup -Filter "displayName eq 'Marketing Department'"
+        Get-IntuneApplicationAssignments -Group $group
+
+        Retrieves all applications assigned to the "Marketing Department" group.
+
+    .OUTPUTS
+        System.Collections.Generic.List[PSCustomObject]
+        A list of objects containing:
+        - DisplayName: Name of the assigned application
+        - LastModified: When the application was last modified
+        - Status: (Only present on error objects) Set to 'Error' when retrieval fails
+        - Error: (Only present on error objects) The error message
+
+    .NOTES
+        Required Graph API permissions:
+        - DeviceManagementApps.Read.All
+    #>
+
+    [CmdletBinding()]
+    [OutputType([System.Collections.Generic.List[PSCustomObject]])]
+    param (
+        [Parameter(Mandatory = $true)]
+        [Microsoft.Graph.PowerShell.Models.MicrosoftGraphGroup]
+        $Group
+    )
+
+    begin {
+        # Define the Graph API version to use
+        # Beta endpoint is required for application assignments as of March 2025
+        $graphApiVersion = 'beta'
+
+        # Construct the Graph API endpoint URI for mobile applications
+        $uri = "https://graph.microsoft.com/$graphApiVersion/deviceAppManagement/mobileApps"
+
+        # Initialize the generic list to store application assignment results
+        # Using a strongly-typed collection for better performance with large result sets
+        $assignmentList = [System.Collections.Generic.List[PSCustomObject]]::new()
+    }
+
+    process {
+        try {
+            Write-Verbose "Retrieving applications assigned to group '$($Group.DisplayName)'"
+
+            # Query Graph API for mobile apps with assignment expansion in a single call
+            # This approach is more efficient than retrieving apps and assignments separately
+            $applicationAssignments = (Invoke-MgGraphRequest -Method Get -Uri "$uri/?`$expand=Assignments" -ErrorAction Stop).Value | Where-Object { $_.assignments.target.groupId -match $Group.id }
+
+            # Handle case when no applications are assigned to this group
+            if ($null -eq $applicationAssignments -or $applicationAssignments.Count -eq 0) {
+                # Create a standardized "not found" object
+                $applicationAssignmentObject = [PSCustomObject]@{
+                    DisplayName  = 'No applications assigned'
+                    LastModified = $null
+                }
+
+                $assignmentList.Add($applicationAssignmentObject)
+                Write-Verbose "No applications found assigned to group '$($Group.DisplayName)'"
+            }
+            else {
+                # Process each application assignment found for this group
+                foreach ($assignment in $applicationAssignments) {
+                    $applicationAssignmentObject = [PSCustomObject]@{
+                        DisplayName  = $assignment.DisplayName
+                        LastModified = $assignment.lastModifiedDateTime
+                    }
+
+                    $assignmentList.Add($applicationAssignmentObject)
+                }
+
+                Write-Verbose "Retrieved $($applicationAssignments.Count) applications assigned to group '$($Group.DisplayName)'"
+            }
+        }
+        catch {
+            # Log the full error details to help with troubleshooting
+            Write-Error "Failed to retrieve application assignments: $_"
+
+            # Create an error object with Status property
+            # This ensures the HTML report generation can continue despite errors
+            $errorObject = [PSCustomObject]@{
+                DisplayName  = 'Error retrieving applications'
+                LastModified = Get-Date  # Include current timestamp for error context
+                Status       = 'Error'   # Status property for report generation logic
+                Error        = $_.Exception.Message
+            }
+
+            $assignmentList.Add($errorObject)
+        }
+    }
+
+    end {
+        # Return the list of assignments
+        $assignmentList
+    }
 }
- # Applications 
 
-$Resource = "deviceAppManagement/mobileApps"
-$graphApiVersion = "Beta"
-$uri = "https://graph.microsoft.com/$graphApiVersion/$($Resource)?`$expand=Assignments"
-$Apps = (Invoke-MgGraphRequest -Method GET -Uri $uri).Value | Where-Object {$_.assignments.target.groupId -match $Group.id}
+function Get-IntuneApplicationConfigurationAssignments {
+    <#
+    .SYNOPSIS
+        Retrieves application configurations assigned to a specific security group in Intune.
 
-Write-host "Following Apps has been assigned to: $($Group.DisplayName)" -ForegroundColor cyan
- 
-foreach ($App in $Apps) {
+    .DESCRIPTION
+        This function uses Microsoft Graph API to retrieve all targeted managed app
+        configurations that are assigned to the specified security group in Microsoft Intune.
 
-  Write-host "$($App.DisplayName)" -ForegroundColor Yellow
-  
+        The function handles three potential scenarios:
+        1. App configurations assigned to the group - returns details for each assigned configuration
+        2. No app configurations assigned to the group - returns a "No application configurations assigned" object
+        3. Error during retrieval - returns an error object with Status property set to 'Error'
 
+        This standardized approach ensures consistent reporting across all Intune policy types
+        and allows the HTML report generation to continue even when errors occur.
+
+    .PARAMETER Group
+        The security group object for which to retrieve assigned application configurations.
+        Must be an object of type Microsoft.Graph.PowerShell.Models.MicrosoftGraphGroup.
+
+    .EXAMPLE
+        $group = Get-MgGroup -Filter "displayName eq 'Marketing Department'"
+        Get-IntuneApplicationConfigurationAssignments -Group $group
+
+        Retrieves all application configurations assigned to the "Marketing Department" group.
+
+    .OUTPUTS
+        System.Collections.Generic.List[PSCustomObject]
+        A list of objects containing:
+        - DisplayName: Name of the assigned application configuration
+        - LastModified: When the configuration was last modified
+        - Status: (Only present on error objects) Set to 'Error' when retrieval fails
+        - Error: (Only present on error objects) The error message
+
+    .NOTES
+        Required Graph API permissions:
+        - DeviceManagementApps.Read.All
+    #>
+
+    [CmdletBinding()]
+    [OutputType([System.Collections.Generic.List[PSCustomObject]])]
+    param (
+        [Parameter(Mandatory = $true, Position = 0)]
+        [Microsoft.Graph.PowerShell.Models.MicrosoftGraphGroup]
+        $Group
+    )
+
+    begin {
+        # Define the Graph API version to use - beta endpoint required for app config assignments
+        $graphApiVersion = 'beta'
+
+        # Define the Graph API URI endpoint for targeted managed app configurations
+        # This endpoint contains all app configurations that can be assigned to groups
+        $uri = "https://graph.microsoft.com/$graphApiVersion/deviceAppManagement/targetedManagedAppConfigurations"
+
+        # Initialize a strongly-typed collection to store results for better performance
+        $assignmentList = [System.Collections.Generic.List[PSCustomObject]]::new()
+    }
+
+    process {
+        try {
+            Write-Verbose "Retrieving application configurations assigned to group '$($Group.DisplayName)'"
+
+            # Query Graph API for app configurations with assignment expansion in a single call
+            # This is more efficient than retrieving configurations and assignments separately
+            $applicationConfigurationAssignments = (Invoke-MgGraphRequest -Method Get -Uri "$uri/?`$expand=Assignments" -ErrorAction Stop).Value | Where-Object { $_.assignments.target.groupId -match $Group.id }
+
+            # Handle case when no application configurations are assigned to this group
+            if ($null -eq $applicationConfigurationAssignments -or $applicationConfigurationAssignments.Count -eq 0) {
+                # Create a standardized "not found" object - consistent with other policy functions
+                $applicationConfigurationAssignmentObject = [PSCustomObject]@{
+                    DisplayName  = 'No application configurations assigned'
+                    LastModified = $null
+                }
+
+                $assignmentList.Add($applicationConfigurationAssignmentObject)
+                Write-Verbose "No application configurations found assigned to group '$($Group.DisplayName)'"
+            }
+            else {
+                # Process each application configuration assignment that targets this group
+                foreach ($assignment in $applicationConfigurationAssignments) {
+                    # Create a standardized object with consistent property names for reporting
+                    $applicationConfigurationAssignmentObject = [PSCustomObject]@{
+                        DisplayName  = $assignment.DisplayName
+                        LastModified = $assignment.lastModifiedDateTime
+                    }
+
+                    $assignmentList.Add($applicationConfigurationAssignmentObject)
+                }
+
+                Write-Verbose "Retrieved $($applicationConfigurationAssignments.Count) application configurations assigned to group '$($Group.DisplayName)'"
+            }
+        }
+        catch {
+            # Log detailed error information for troubleshooting purposes
+            Write-Error "Failed to retrieve application configuration assignments: $_"
+
+            # Create an error object with Status property
+            # This ensures the HTML report can include error information for this section
+            $errorObject = [PSCustomObject]@{
+                DisplayName  = 'Error retrieving application configurations'
+                LastModified = Get-Date -Format 'yyyy-MM-dd HH:mm:ss' # Consistent timestamp formatting
+                Status       = 'Error' # Status property for report generation logic
+                Error        = $_.Exception.Message # Original error for troubleshooting
+            }
+
+            $assignmentList.Add($errorObject)
+        }
+    }
+
+    end {
+        # Return the list of assignments
+        $assignmentList
+    }
 }
 
- # Application Configurations (App Configs)
+function Get-IntuneApplicationProtectionAssignments {
+    <#
+    .SYNOPSIS
+        Retrieves application protection policies assigned to a specific security group in Intune.
 
+    .DESCRIPTION
+        This function uses Microsoft Graph API to retrieve all application protection policies that are
+        assigned to the specified security group in Microsoft Intune across different platforms
+        (Android, iOS, Windows).
 
-$Resource = "deviceAppManagement/targetedManagedAppConfigurations"
-$graphApiVersion = "Beta"
-$uri = "https://graph.microsoft.com/$graphApiVersion/$($Resource)?`$expand=Assignments"
-$AppConfigs = (Invoke-MgGraphRequest -Method GET -Uri $uri).Value | Where-Object {$_.assignments.target.groupId -match $Group.id}
+        The function handles multiple platforms simultaneously and supports three scenarios:
+        1. Protection policies assigned to the group - returns details for each policy by platform
+        2. No protection policies assigned - returns "No application protection policies assigned" for each platform
+        3. Error during retrieval - returns an error object with Status property set to 'Error'
 
-Write-host "Following App Configuration has been assigned to: $($Group.DisplayName)" -ForegroundColor cyan
- 
-foreach ($AppConfig in $AppConfigs) {
+        Since application protection policies are platform-specific, the function queries multiple
+        Graph API endpoints and aggregates the results into a single collection for reporting.
+        Each result object includes the platform type to facilitate sorting in the final report.
 
-  Write-host "$($AppConfig.DisplayName)" -ForegroundColor Yellow
-  
+    .PARAMETER Group
+        The security group object for which to retrieve assigned application protection policies.
+        Must be an object of type Microsoft.Graph.PowerShell.Models.MicrosoftGraphGroup.
 
+    .EXAMPLE
+        $group = Get-MgGroup -Filter "displayName eq 'Marketing Department'"
+        Get-IntuneApplicationProtectionAssignments -Group $group
+
+        Retrieves all application protection policies across all platforms that are assigned to
+        the "Marketing Department" group.
+
+    .OUTPUTS
+        System.Collections.Generic.List[PSCustomObject]
+        A list of objects containing:
+        - ApplicationProtectionPolicyPlatform: The platform type (Android, iOS, Windows)
+        - DisplayName: Name of the assigned policy
+        - LastModified: When the policy was last modified
+        - Status: (Only present on error objects) Set to 'Error' when retrieval fails
+        - Error: (Only present on error objects) The error message
+
+    .NOTES
+        Author: Systems Administration Team
+        Required Graph API permissions:
+        - DeviceManagementApps.Read.All
+
+        This function is designed to handle platform-specific differences in protection policies
+        and provides platform context in the returned objects to facilitate reporting.
+    #>
+
+    [CmdletBinding()]
+    [OutputType([System.Collections.Generic.List[PSCustomObject]])]
+    param (
+        [Parameter(Mandatory = $true)]
+        [Microsoft.Graph.PowerShell.Models.MicrosoftGraphGroup]
+        $Group
+    )
+
+    begin {
+        # Define the Graph API version to use
+        # Beta endpoint is required for application protection policy assignments as of March 2025
+        $graphApiVersion = 'beta'
+
+        # Set the base URI for the Microsoft Graph API
+        $uri = "https://graph.microsoft.com/$graphApiVersion"
+
+        # Define the endpoints for different types of application protection policies
+        # This approach enables checking multiple protection policy types across platforms
+        $applicationProtectionPoliciesEndpoints = @{
+            AndroidManagedAppProtections            = 'deviceAppManagement/androidManagedAppProtections'
+            iOSManagedAppProtections                = 'deviceAppManagement/iosManagedAppProtections'
+            MdmWindowsInformationProtectionPolicies = 'deviceAppManagement/mdmWindowsInformationProtectionPolicies'
+            WindowsManagedAppProtections            = 'deviceAppManagement/windowsManagedAppProtections'
+        }
+
+        # Create a strongly-typed collection to store results for better performance
+        # This will contain entries from multiple platforms
+        $assignmentList = [System.Collections.Generic.List[PSCustomObject]]::new()
+
+        # Flag to track if any assignments are found across all platforms
+        $foundAssignments = $false
+    }
+
+    process {
+        try {
+            Write-Verbose "Retrieving application protection policies assigned to group '$($Group.DisplayName)'"
+
+            # Iterate through each protection policy endpoint (Android, iOS, Windows, etc.)
+            # Each platform has a different endpoint that needs to be queried separately
+            foreach ($endpoint in $applicationProtectionPoliciesEndpoints.GetEnumerator()) {
+                try {
+                    # Construct the full endpoint URI with assignments expansion
+                    $endpointUri = "$uri/$($endpoint.Value)?`$expand=Assignments"
+                    Write-Verbose "Querying endpoint: $endpointUri for platform: $($endpoint.Key)"
+
+                    # Query Graph API in a single call with assignments expanded
+                    # This is more efficient than retrieving policies and assignments separately
+                    $response = Invoke-MgGraphRequest -Method Get -Uri $endpointUri -ErrorAction Stop
+
+                    # Filter the results to only include policies assigned to our target group
+                    $applicationProtectionPolicyAssignments = $response.Value | Where-Object { $_.assignments.target.groupId -match $Group.id }
+
+                    # If no protection policies are assigned for this platform/endpoint
+                    if ($null -eq $applicationProtectionPolicyAssignments -or $applicationProtectionPolicyAssignments.Count -eq 0) {
+                        # Create a standardized "not found" object for this platform
+                        $applicationProtectionPolicyAssignmentObject = [PSCustomObject]@{
+                            ApplicationProtectionPolicyPlatform = $endpoint.Key
+                            DisplayName                         = 'No application protection policies assigned'
+                            LastModified                        = $null
+                        }
+
+                        $assignmentList.Add($applicationProtectionPolicyAssignmentObject)
+                        Write-Verbose "No $($endpoint.Key) protection policies assigned to group '$($Group.DisplayName)'"
+                    }
+                    # Process each protection policy assignment found for this platform
+                    else {
+                        $foundAssignments = $true
+                        foreach ($applicationProtectionPolicyAssignment in $applicationProtectionPolicyAssignments) {
+                            # Create a standardized object with platform context for reporting
+                            $applicationProtectionPolicyAssignmentObject = [PSCustomObject]@{
+                                ApplicationProtectionPolicyPlatform = $endpoint.Key
+                                DisplayName                         = $applicationProtectionPolicyAssignment.DisplayName
+                                LastModified                        = $applicationProtectionPolicyAssignment.lastModifiedDateTime
+                            }
+
+                            $assignmentList.Add($applicationProtectionPolicyAssignmentObject)
+                        }
+
+                        Write-Verbose "Retrieved $($applicationProtectionPolicyAssignments.Count) $($endpoint.Key) protection policies assigned to group '$($Group.DisplayName)'"
+                    }
+                }
+                catch {
+                    # Log detailed error information for this specific platform
+                    Write-Error "Failed to retrieve $($endpoint.Key) protection policy assignments: $_"
+
+                    # Create a platform-specific error object with Status property
+                    $errorObject = [PSCustomObject]@{
+                        ApplicationProtectionPolicyPlatform = $endpoint.Key
+                        DisplayName                         = "Error retrieving $($endpoint.Key) protection policies"
+                        LastModified                        = Get-Date -Format 'yyyy-MM-dd HH:mm:ss' # Consistent timestamp formatting
+                        Status                              = 'Error' # Status property for report generation logic
+                        Error                               = $_.Exception.Message
+                    }
+
+                    $assignmentList.Add($errorObject)
+                }
+            }
+
+            # Provide a summary message if no assignments were found across any platform
+            if (-not $foundAssignments) {
+                Write-Verbose "No application protection policies assigned to group '$($Group.DisplayName)' across any platform"
+            }
+        }
+        catch {
+            # Handle any general errors that occur outside the platform-specific processing
+            Write-Error "Failed to process application protection policy assignments: $_"
+
+            # Create a generic error object when the platform cannot be determined
+            $errorObject = [PSCustomObject]@{
+                ApplicationProtectionPolicyPlatform = 'Unknown'
+                DisplayName                         = 'Error retrieving application protection policies'
+                LastModified                        = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+                Status                              = 'Error'
+                Error                               = $_.Exception.Message
+            }
+
+            $assignmentList.Add($errorObject)
+        }
+    }
+
+    end {
+        # Return the list of assignments from all platforms
+        # The calling function typically sorts these by platform for better reporting
+        $assignmentList
+    }
 }
 
-## App protection policies
+function Get-IntuneAssignmentSelectionForm {
+    <#
+    .SYNOPSIS
+        Displays a GUI window to select security group and Intune policy types for reporting.
 
+    .DESCRIPTION
+        This function displays a professionally styled WPF window that allows the user to enter
+        a security group name and select which Intune policy types to include in the report.
 
-$AppProtURIs = @{
-    iosManagedAppProtections = "https://graph.microsoft.com/beta/deviceAppManagement/iosManagedAppProtections?`$expand=Assignments"
-    androidManagedAppProtections = "https://graph.microsoft.com/beta/deviceAppManagement/androidManagedAppProtections?`$expand=Assignments"
-    windowsManagedAppProtections = "https://graph.microsoft.com/beta/deviceAppManagement/windowsManagedAppProtections?`$expand=Assignments"
-    mdmWindowsInformationProtectionPolicies = "https://graph.microsoft.com/beta/deviceAppManagement/mdmWindowsInformationProtectionPolicies?`$expand=Assignments"
-  }
+        The form provides a user-friendly interface with proper keyboard navigation support and input validation.
 
+        The interface includes:
+        - Security group name input field with validation
+        - Policy type selection with categorized checkboxes
+        - Select All option for convenience
+        - Context-specific error messaging
+        - Proper cancel and submit buttons
 
-$graphApiVersion = "Beta"
+        The function handles both successful submissions and cancellations through
+        a structured return object with Status property.
 
-$AllAppProt = $null
-foreach ($url in $AppProtURIs.GetEnumerator()) {
+    .PARAMETER OutputPath
+        The folder path where the HTML report will be saved.
+        This is displayed to the user in the form for transparency.
 
+    .EXAMPLE
+        $selection = Get-IntuneAssignmentSelectionForm -OutputPath "C:\Reports"
 
- $AllAppProt = (Invoke-MgGraphRequest -Method GET -Uri $url.value).Value | Where-Object {$_.assignments.target.groupId -match $Group.id} -ErrorAction SilentlyContinue
-  Write-host "Following App Protection / "$($url.name)" has been assigned to: $($Group.DisplayName)" -ForegroundColor cyan
-  foreach ($AppProt in $AllAppProt) {
+        Displays a selection form showing C:\Reports as the output location and returns the selected options.
 
-    Write-host "$($AppProt.DisplayName)" -ForegroundColor Yellow
-     
-  }
-  } 
+    .EXAMPLE
+        $selection = Get-IntuneAssignmentSelectionForm -OutputPath $HtmlSavePath
+        if ($selection.Status -eq 'Cancelled') {
+            Write-Warning "Operation cancelled by user"
+            return
+        }
 
-# Device Configuration
+        Shows how to handle user cancellation in the main script.
 
-$DCURIs = @{
-    ConfigurationPolicies = "https://graph.microsoft.com/beta/deviceManagement/configurationPolicies?`$expand=Assignments"
-    DeviceConfigurations = "https://graph.microsoft.com/beta/deviceManagement/deviceConfigurations?`$expand=Assignments"
-    GroupPolicyConfigurations = "https://graph.microsoft.com/beta/deviceManagement/groupPolicyConfigurations?`$expand=Assignments"
-    mobileAppConfigurations = "https://graph.microsoft.com/beta/deviceAppManagement/mobileAppConfigurations?`$expand=Assignments"
-  }
-  
-$AllDC = $null
-foreach ($url in $DCURIs.GetEnumerator()) {
+    .INPUTS
+        None. You cannot pipe objects to Get-IntuneAssignmentSelectionForm.
 
+    .OUTPUTS
+        [PSCustomObject] Returns a custom object containing:
+        - GroupName: The name of the security group to check
+        - PoliciesToCheck: A hashtable of the selected policy types
+            - If "Select All" was chosen, contains a single key 'All' with value $true
+            - Otherwise, contains keys for each policy type with boolean values
+        - Status: Either 'Success' or 'Cancelled' to indicate the operation result
 
-  $AllDC = (Invoke-MgGraphRequest -Method GET -Uri $url.value).Value | Where-Object {$_.assignments.target.groupId -match $Group.id} -ErrorAction SilentlyContinue
-  Write-host "Following Device Configuration / "$($url.name)" has been assigned to: $($Group.DisplayName)" -ForegroundColor cyan
-  foreach ($DCs in $AllDC) {
+    .NOTES
+        Author: Systems Administration Team
+        The function uses WPF to create the GUI window and requires the PresentationFramework assembly.
 
-    #If statement because ConfigurationPolicies does not contain DisplayName. 
-      if ($($DCs.displayName -ne $null)) { 
-      
-      Write-host "$($DCs.DisplayName)" -ForegroundColor Yellow
-      } 
-      else {
-        Write-host "$($DCs.Name)" -ForegroundColor Yellow
-      } 
-  }
-  } 
+        Keyboard shortcuts:
+        - Enter: Process selections/confirm (bound to the Generate Report button)
+        - Escape: Cancel operation (closes the form with Status='Cancelled')
+        - Tab: Navigate between form elements
+    #>
 
-### Remediation scripts 
+    [CmdletBinding()]
+    [OutputType([PSCustomObject])]
+    param (
+        [Parameter(Mandatory = $true)]
+        [string]
+        $OutputPath
+    )
 
-$uri = "https://graph.microsoft.com/beta/deviceManagement/deviceHealthScripts"
-$REMSC = Invoke-MgGraphRequest -Method GET -Uri $uri
-$AllREMSC = $REMSC.value 
-Write-host "Following Remediation Script has been assigned to: $($Group.DisplayName)" -ForegroundColor cyan
- 
-foreach ($Script in $AllREMSC) {
+    begin {
+        # Base64 string of the icon for the window - embedded for portability
+        $iconBase64 = 'iVBORw0KGgoAAAANSUhEUgAAAeAAAAHgCAYAAAB91L6VAAAACXBIWXMAAAsTAAALEwEAmpwYAAAXsUlEQVR4nO3dXaxmV1kH8D1TQoELoQidvU6nTEJ6hYH4caNAJRrlS0nEUhUTqw3cGFNJ4ex9qjfHmAIV6keNifGWCwsD6gU3RkNKlVIvinPWOkPBRkAKkZkmfGnAlos5Zs+gnFLmnXdm3r3X3mv9fslKCLRTzvP+1/Pve87Z5zQNAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAKW59eQ1oYs3hz7eG7r0cOjT2dCn74Q+HThmIAMyMFIGhh1z9sLOGXZPvHnYRbnXIUzi+J2ffG7o0s53C9eiNQMZkIHcGTgb+tgPu0kNUKy2S7e2XfqShZN94ThmIAPfl4G2j4+3fXxL7j0JG3ZwJHTxD0Ifz1l8Fp8MyMB8MxDPtX26p9k9OKoGWL7dg6NtHz+Y/2I5ZiADMrBeBoadpYRZvLaL73HpLX4ZkIHFZaBLd+fen3BVX/P1aecZLBLHDGTgCjIQz7Xbe7eoABZn+I7C4ZsaXHzLXwZkYKkZaPv05bD7yPNy71O4LKFPv5f78jhmIAMycPUZiL31z8J+yEZ6wvKz/GRABhafgS6e8cM6WIy2S6/JfmkcM5ABGdhUBnb2Xp17r8JaQp/+xPKz/GRABorJQBffb/2zCKFP/5L9wjhmIAMysKEMtF18KPdehbX4+q/Fp/xkoLivA8MStF18KvuFccxABmRgU++A+/hk7r0Ka7H4LD4ZkIHSMmD9swi5L4pjBjIgAwqYKll+lp8MyEBpGci9V2EtuS+KYwYyIAMKmCpZfpafDMhAaRnIvVdhLbkvimMGMiADCpgqWX6WnwzIQGkZyL1XYS25L4pjBjIgAwqYKll+lp8MyEBpGci9V2EtuS+KYwYyIAMKmCpZfpafDMhAaRnIvVdhLbkvimMGMiADCpgqWX6WnwzIQGkZyL1XYS25L4pjBjIgAwqYKll+lp8MyEBpGci9V2EtLggwFvsFVnBBgLHYL7CCCwKMxX6BFVwQYCz2C6zgggBjsV9gBRcEGIv9Aiu4IMBY7BdYwQUBxmK/wAouCDAW+wVWcEGAsdgvsIILAozFfoEVXBBgLPYLrOCCAGOxX2AFFwQYi/0CK7ggwFjsF1jBBQHGYr/ACi4IMBb7BVZwQYCx2C+wggsCjMV+gRVcEGAs9gus4IIAY7FfYAUXBBiL/QIruCDAWOwXWMEFAcZiv8AKLggwFvsFVnBBgLHYL7CCCwKMxX6BFVwQYCz2C6zgggBjsV9gBRcEGIv9Aiu4IMBY7BdYwQUBxmK/wAouCDAW+wVWcEGAsdgvsIILAozFfoEVXBBgLPYLrOCCAGOxX2AFFwQYi/0CK7ggwFjsF1jBBQHGYr/ACi4I0zo4cv1OfPlWn25vu/jeto9/G7qUQp8+33bpa6FP3xnOd//z54f/bfhrhr92+HuGv3f4M7xqwOIpYMZ24h2nXhC6+PbQp5OhS09cdeYu/BknQ7//tuHP9goCi6SAGcfBkbZLbxyKsu3i/4yVs/N/dhc/NPyzvDMGFkUBs1G7B0e3dvbe1PbpU5Nnq0un2+2925rdB57lVQVmTwGzKW0f39B26d9yZer/3xX36bPt9t7rvbLArClgrtaN3ae2Qh8/kLt4n3niR9t3ffqEVxiYJQXMVeVnO7257dPX85ftRUv4m1vd/q96lYHZUcBciZvueOzatov35S/YtYv4A8fv/ORzvdrAbChgLtfw6E/bpX/OX6qXebr08NZdj/6wVxyYBQXM5Xjx9um27eJe9jK98hI+fUMfj3vVgewUMJf3zVbp89lL9OpL+HPDx+KVB7JSwKzjup1Hnt/28VT28tzc2X/JXek6rz6QjQLmUk7sfuE5bR8/MYPS3PQ74QeHbyaTACALBcylMxL/MntZjnTaPv65BABZKGBWabt0a+6SHP+dcHyrFACTU8BcNBs7p18y/CCL8gs4fcN3RgOTU8BczPnf1Zu7HKcr4Q9LAjApBcwPzsXe67KX4sTnwq80BJiIAuYZbj15zRx+q9H0BRw/M3zsEgFMQgHzjEzsxF/PXYa5jl/cAExGAfN0B0dCl1LuInTMQAYWm4HvhD6dHX72eujjvaGLN/vMkgJmDcPXQWdwgR0zkIGyMnA29LH3G8m8A2b1Z0ROzuCyOmYgAwVmoO3j420f32IJ+xQ0P/DnPadv576kjhnIQMkZiOfaPt3T7B4crX4J53oRqh/8DIUuvj3/5XTMQAZqyEDbxw9WX8IKmO8VcPpw7kvpmIEMVJSBLt1d9QZWwBz67ucnsl9IxwxkoKIMxHPt9t4t1W5hBczghu30ivyX0TEDGagtA22fvhx2H3lelZtYATPY6tPtuS+iYwYyUGsGYl/lJlbADIbvSsx/CR0zkIEqM9DFM1X+sA4FzKDt499lv4SOGchAvRnY2Xt1ddtYATNo+xizX0DHDGSg3gx08f3VbWMFzIUcxP/IfgEdM5CBajPQdvGh6raxAmbQ9vGruS+gYwYyUPnXgWujgBm0XXwq+wV0zEAGqs1A28cnq9vGCpiBAs6/gBwzqD0DTW0MmoFPQedfPo4Z1J6BpjYGzYUc+Cas3MvHMYPaM9DUxqAZeAwp//JxzKD2DDS1MWgGfhBH/uXjmEHtGWhqY9AM/CjK/MvHMYPaM9DUxqAZ+GUM+ZePYwa1Z6CpjUEzuH4nvjz35XPMQAbqzkBTG4PmgoMjoU9nc19AxwxkoN4MNLUxaA5l4WTuC+iYgQzUm4GmNgbN97Kw/7bcF9AxAxmoNwNNbQya/3PdziPPb/v07dyX0DEDGagzA01tDJrvy4NPQ89gETlmUGMGmtoYNIe1XXpj7kvomIEM1JmBpjYGzdMdHAldSrkvomMGMlBfBpraGDTPyEQX35r7IuY6x/r0KxJB7YICNmgyufXkNW2fPpu7DCc/XXy02T04KnfULihggybjBdzef232Qpz4tH18g8xBo4AnW7T+TYeLZ+MjFb37/ZAgwAV6YSIGzcVsvXP/xtClb5T/zjd9/fidp26QBLhAL0zEoFml7eNbchfkuCeea/v9X5YC+B69MBGD5pIZ6dJfFPvut0t/KgHwdHphIgbNpdx0x2PXhi49mLssN366+MDLdk8/WwLg6fTCRAyadbzwjsd+qO3jqXLKN6UT7zj1Aq8+PJNemIhBs64bu09thS59Lnt5XvWJ//6i3380eOVBL2SlgLkcL94+3S78nfD+DX087lUHvZCdAuZyDZ+6XebXhOPHh1+56BUHvTALCpgr/castov3DY/x5C/Wtc5f+YYr0AuzooC5qvx06ZfaLn1txu96v+kXLIBemCUFzEa+OauPH5hh+X407Jx+iVcY9MIsKWA2l6W917Vd/Ez24u3io6FPP++VhSu9yynL3a3u9TJoNmr34OjWzt6bQpcemb54U2q3924bfp2iVxWuXFDA0zBoxnFwpN3ee33bxw+2ffr2WDkb/uy2S/cP/6zhn+nVhKsXFPA0DJqxDY/+bPXp9qEoQxfPbOBTzGeGP+vYdvyt4Sd0eQVhs4ICnoZBM62DI8f6Uz/S9vE32y6+Z/idw+d/sEeXPtf28attF586f/r41fP/XZf+9cJfk949fHp5+Hu9YjCuoICnYdAAHKYXJmLQABymFyZi0AAcphcmYtAAHKYXJmLQABymFyZi0AAcphcmYtAAHKYXJmLQABymFyZi0AAcphcmYtAAHKYXJmLQABymFyZi0AAcphcmYtAAHKYXJmLQABymFyZi0AAcphcmYtAAHKYXJmLQABymFyZi0AAcphcmYtAAHKYXJmLQABymFyZi0ECtQp9OHr/z9Atz//+Ym9CngxynqY1BA7Ua9l/bx8ePdfs/k/v/y5wEBWzQANMUTTzXdvG+m+547FoTbxTwVPybDlCrZ+y/Lp3e2j79o03lgnfABg0wddG0fXwydGmn2T04Wuv0gwI2aIBsRdOlj229c//GGl+BoIANGiBr0XTpG+323m21vQpBARs0wEyKpqrHlYICNmiAuRRNTY8rBQVs0ADzKpo6HlcKCtigAWZZNIU/rhQUsEEDzLVoSn5cKShggwaYfdEU+LhSUMAGDbCIoinscaWggA0aYGFFU8TjSkEBGzTA0oqmhMeVggI2aIBlFs2yH1cKCtigARZdNAt9XCkoYIMGWHrRLPFxpaCADRqgmKJZ0ONKQQGXPWjHDGRABqrLwEIeVwoKuOxBO2YgAzJQcQZm/bhSUMBlD9oxAxmQgZozMOfHlYICLnvQjhnIgAzIwDwfVwoKuOxBO2YgAzIgA/N8XCko4LIH7ZiBDMiADMzzcaWggMsetGMGMiADMjDPx5WCAi570I4ZyIAMyMA8H1cKCrjsQTtmIAMyIAPzfFwpKOCyB+2YgQzIgAzM83GloIDLHrRjBjIgAzIwz8eVggKehgtgCcqADMjAQjIw0eNKQQFPI3ugHDOQARmQgVk9rhQU8DQE3/KTARmQgQVmYMTHlYICnkb2EDlmIAMyIAOzelwpKOBptF18SvgtQBmQARlYYAYU8LKFLj2RPUSOGciADMjA5ZavT0EvXejSw4Jv+cmADMjAMjLgm7AKEvp4b+5AOWYgAzIgA2u96/UYUklCF28WfMtPBmRABuacAT+Io0y3nrwm9Ols/oA5ZiADMiADP+BTzn4UZclCH3sX38WXARmQgdllwC9jKN2J3S88p+3iF2cQNscMZEAGZMCvI6xLu713y/B1Bpff5ZcBGZCBMh8vWlfI9LE3NQtdutvFs3xlQAZkoMzHi9bugl4BT2/34GjbpftdPgtYBmRABsp7vGhdQQHncnBk+Lcwn462gC1gGZCBsh4vWldQwPm/Jjx8+7sLaAnLgAzIQBmPF60rKOB5fHf0sS52oYtnXEBLWAZkQAaW/XjRuoICnpHdg6Nhe/9VoU/va7v40FDIfouSZWwZy4AMzOPXB25aUMAwP6Us3NxzZB5qe7xoXcG9hPnJXZwKmKXleU6PF60ruJcwP7mLUwGzqDzP7PGidQX3EuYnd3EqYJaR53k+XrSu4F7C/OQuTgXM3PM858eL1hXcS5if3MWpgJl5nmf9eNG6gnsJ85O7OBUws8zzQh4vWldwL2F+chenAmZ2eV7Q40XrCu4lzE/u4lTAzCXPS3y8aF3BvYT5yV2cCphZ5HmhjxetK7iXMC/DIxW5i3NT52W7p5+de57kV9vjResKChjmJbzzkRflLs5NnRK+U5WrV9vjResKChjm5fq70ktzF+emTvuuT5/IPU/yq+3xonUFBQzzstXvvzJ3cW7qXN/Hn8w9T/Kr7fGidQUFDPOy1afbi3kHXOFS5Zlqe7xoXUEBw7y0fbqnmALu07tzz5P8anu8aF1BAcO8tH36x2IKuEt/n3ue5Ffb40XrCgoY5mN4bKft0rcKKuBveRSJ2h4vWldQwDAfbZdek7s0N3529l6de67kVdvjResKChjmY3h3kL0wN326+Me550pebZ/++sQ7Tr3A6/B0ChjmYveBZ4UunimwgM8MH1vu8S6RBV224B0wzMPWzt6bspflSOfYTvqF3PNdIgu6bEEBwzy0ffqn3EU54rvgB3LPd4ks6LIFBQz5FfnNV99/fDPWZbOgyxYUMOR2cCR06cHsBTn6u+D0sdyTXhoLumxBAUNebbf/G9nLcaKz1e/9mrytz4IuW1DAkM/waEbo41dyF+N074Ljf16388jzZW49FnTZggKGrBfwI9lLcfpzUubWzkeW18jrM43g9YU8Qp9+dwZlmOW0O3u/LXdrZUQBFyx4fWF6W9vp59ouPlVtAffxyWM7ez8re6tZ0GULChimdcN2esXwC8hzl2D+E/8rdPHH5e/iLOiyBQUME164u9JPhD6dzV9+szlnt3b2fkwGL5IXC7powesL0xg+5Rr6+M0ZlN68Thf/O2zvv1YOLejaBAUME1y07XRHzV/zXe9rwvF3ZNGCrklQwDDyc75d/JvcBbegc9JzwhZ0LYIChvF+u1HbpS/NoNQWduJX2u2924Yf0Vl7Ni3osgUFDJvV7sSfruJnO499uvhA6OLNNefTgi5bUMCwAbsPPOv8O96Sf6VgtiJODx7r9n9xmHFtWbWgyxYUMFyZm+547Nrh1wi2XbzPo0WTlPHZtk9/NnyGYZh9Dbm1oMsWFDBc3Mt2Tz/7+J2nX3j9XemlW9vpp7b6dHvbxfe2XfyHtkvfyv7usNIzzP7CaxDfO7wmw2szvEbDazW8ZqVk2oIuW1DALEHuhe+YwToZKCX3m/448PqyYApQAS4hA6XkftMfB15fFiz3YnXMQAFTyl5rYAlBdcwg52KzoMsWFDBLoAgV4RIyUEruN/1x4PVlwXIvVscMFDCl7LUGlhBUxwxyLjYLumxBAbMEilARLiEDpeR+0x8HXl8WLPdidcxAAVPKXmtgCUF1zCDnYrOgyxYUMEugCBXhEjJQSu43/XHg9WXBci9WxwwUMKXstQaWEFTHDHIuNgu6bEEBswSKUBEuIQOl5H7THwdeXxYs92J1zEABU8pea2AJQXXMIOdis6DLFhQwS6AIFeESMlBK7jf9ceD1ZcFyL1bHDBQwpey1BpYQVMcMci42C7psQQGzBIpQES4hA6XkftMfB15fFiz3YnXMQAFTyl5rYAlBdcwg52KzoMsWFDBLoAgV4RIyUEruN/1x4PVlwXIvVscMFDCl7LUGlhBUxwxyLjYLumxBAbMEilARLiEDpeR+0x8HXl8WLPdidcxAAVPKXmtgCUF1zCDnYrOgyxYUMEugCBXhEjJQSu43/XHg9WXBci9WxwwUMKXstQYAC7pmQQEDzJMFXbaggAHmyYIuW1DAAPNkQZctKGCAebKgyxYUMMA8WdBlCwoYYJ4s6LIFBQwwTxZ02YICBpgnC7psQQEDzJMFXbaggAHmyY9A9SNQgx9FCaCA/QtBGf9C0ADgHXDuMqrxNAAo4NxlVONpAFDAucuoxtMAoIBzl1GNpwFAAecuoxpPA4ACzl1GNZ4GAAWcu4xqPA0ACjh3GdV4GgAUcO4yqvE0ACjg3GVU42kAUMC5y6jG0wCggHOXUY2nAUAB5y6jGk8DgALOXUY1ngYABZy7jGo8DQAKOHcZ1XgaABRw7jKq8TQAKODcZVTjaQBQwHMohtyFGBQwwLzkXtS1FEPujztUMmeAxci9qGsphtwfd6hkzgCLkXtR11IMuT/uUMmcARYj96KupRhyf9yhkjkDLEbuRV1LMeT+uEMlcwZYjNyLupZiyP1xh0rmDLAYuRd1LcWQ++MOlcwZYDFyL+paiiH3xx0qmTPAYuRe1LUUQ+6PO1QyZ4DFyL2onTJn0ACggHOXUY2nAUAB5y6jGk8DgALOXUY1ngYABZy7jGo8DQCrtV18KveydsqaQdvHJ907gEu9A+7SE7kXtlPYDLp4xsUDuHQBP5x9YTtFzaDt4ydcPIBLfg043pt7YTtlzaDt0h+5eACXfAccb869sJ2yZrDV77/SxQO4lFtPXhP6dDb30nYK+vrv7sFRFw9gDaGPffbF7RQxg7ZL73LpANZ0YvcLz2m7+MXcy9tZ9gzaLn3p+J2ffK6LB3AZ2u29W0Ifz+Ve4s5SZxDPhe30ZpcO4AqELt2df5E7i5xBF//QpQO4UrsHR9su3Z99mTuLmkHbpft94xXAVTs4Erq049PR+Ytt/ieea/t0j/IF2PDXhNs+Pp5/yTtznEE7fNOer/kCjPfd0ce62A3PduZe+M5MZtDFM22/vz1kw70DGNvuwdGwvf+q0Kf3tV186PwS9luUaniX+9R3X+uHhtd+yIBPNwMAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA0BfpfHl4SgvJlUN8AAAAASUVORK5CYII='
 
-$SCRIPTAS = (Invoke-MgGraphRequest -Method GET -Uri "https://graph.microsoft.com/beta/deviceManagement/deviceHealthScripts/$($Script.Id)/assignments").value 
+        # Create a temporary icon file path in the user's temp directory
+        $iconPath = "$env:TEMP\$($MyInvocation.ScriptName)-icon.ico"
 
-  if ($SCRIPTAS.target.groupId -match $Group.Id) {
-  Write-host "$($Script.DisplayName)" -ForegroundColor Yellow
-  }
+        # Convert the base64 string to bytes and create an icon file if needed
+        if (-Not (Test-Path $iconPath)) {
+            $iconBytes = [Convert]::FromBase64String($iconBase64)
+            try {
+                [System.IO.File]::WriteAllBytes($iconPath, $iconBytes)
+            }
+            catch {
+                Write-Warning "Failed to create icon file: $_"
+                # Continue without the icon if it fails - non-critical functionality
+            }
+        }
 
+        # Initialize colors for consistent styling
+        $colorBlue = '#007EC3'      # Primary brand color
+        $colorNavy = '#051D2E'      # Dark palette
+        $colorDarkGray = '#3D3936'  # Dark palette
+        $colorMediumGray = '#757982' # Dark palette
+        $colorGoldenrod = '#F1C400' # Light palette
+        $colorLightGray = '#CECECE' # Light palette
+        $colorOrange = '#D45D00'    # Light palette - used for validation errors
+        $colorTeal = '#269A91'      # Light palette
+
+        # XAML definition for the WPF UI
+        # This creates a structured form with sections for different policy groups
+        [xml]$xaml = @"
+<Window
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    Title="Intune Report Generator"
+    Height="760"
+    Width="600"
+    WindowStartupLocation="CenterScreen"
+    MinWidth="550"
+    MinHeight="740"
+    Background="#F9F9F9"
+    Topmost="True">
+    <Grid>
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+        </Grid.RowDefinitions>
+
+        <!-- Header with branding -->
+        <Border Grid.Row="0" Background="$colorNavy" Padding="15,10">
+            <TextBlock Text="Intune Assignment Report Generator"
+                    Foreground="White"
+                    FontSize="18"
+                    FontWeight="SemiBold"
+                    HorizontalAlignment="Left" />
+        </Border>
+
+        <!-- Main content area -->
+        <Grid Grid.Row="1" Margin="20,15">
+            <Grid.RowDefinitions>
+                <RowDefinition Height="Auto"/>  <!-- Description -->
+                <RowDefinition Height="Auto"/>  <!-- Group Name -->
+                <RowDefinition Height="Auto"/>  <!-- Policy Types Label -->
+                <RowDefinition Height="Auto"/>  <!-- Policy Types Error -->
+                <RowDefinition Height="Auto"/>  <!-- All Policies Checkbox -->
+                <RowDefinition Height="Auto"/>  <!-- Applications Section -->
+                <RowDefinition Height="Auto"/>  <!-- Device Policies Section -->
+                <RowDefinition Height="Auto"/>  <!-- Scripts Section -->
+                <RowDefinition Height="Auto"/>  <!-- Required Fields Note -->
+                <RowDefinition Height="Auto"/>  <!-- Output Path Info -->
+                <RowDefinition Height="Auto"/>  <!-- Buttons -->
+            </Grid.RowDefinitions>
+
+            <!-- Description text -->
+            <TextBlock Grid.Row="0"
+                Text="This tool creates a report of all Intune policies assigned to the specified security group."
+                TextWrapping="Wrap"
+                Margin="0,0,0,15"/>
+
+            <!-- Group Name section with validation -->
+            <Grid Grid.Row="1">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="150"/>
+                    <ColumnDefinition Width="*"/>
+                </Grid.ColumnDefinitions>
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="Auto"/>
+                </Grid.RowDefinitions>
+
+                <Label Grid.Row="0" Grid.Column="0" VerticalAlignment="Center" Margin="0,5">
+                    <StackPanel Orientation="Horizontal">
+                        <TextBlock Text="Security Group Name"/>
+                        <TextBlock Text="*" Foreground="Red" FontWeight="Bold"/>
+                        <TextBlock Text=" :" Margin="-2,0,0,0"/>
+                    </StackPanel>
+                </Label>
+                <Grid Grid.Row="0" Grid.Column="1">
+                    <TextBox x:Name="GroupNameTextBox"
+                        Padding="8,6"
+                        ToolTip="Enter the exact name of the security group to check"/>
+                </Grid>
+                <TextBlock x:Name="GroupNameError"
+                    Grid.Row="1" Grid.Column="1"
+                    Foreground="$colorOrange"
+                    FontStyle="Italic"
+                    FontSize="11"
+                    Margin="0,2,0,5"
+                    Visibility="Collapsed"/>
+            </Grid>
+
+            <!-- Policy selection header -->
+            <TextBlock Grid.Row="2"
+                Text="Select Policy Types to Include:"
+                FontWeight="SemiBold"
+                Margin="0,15,0,5"/>
+
+            <!-- Policy Type Error Message -->
+            <TextBlock Grid.Row="3"
+                x:Name="PolicyTypeError"
+                Text="Please select at least one policy type"
+                Foreground="$colorOrange"
+                FontStyle="Italic"
+                FontSize="11"
+                Margin="0,0,0,5"
+                Visibility="Collapsed"/>
+
+            <!-- Select All Checkbox -->
+            <CheckBox x:Name="SelectAllCheckBox" Grid.Row="4"
+                Content="Select All Policy Types"
+                Margin="0,0,0,10"
+                FontWeight="SemiBold"/>
+
+            <!-- Applications Section -->
+            <Border Grid.Row="5"
+                Background="#F0F0F0"
+                CornerRadius="3"
+                Padding="10"
+                Margin="0,0,0,10">
+                <StackPanel>
+                    <TextBlock Text="Applications" FontWeight="SemiBold" Margin="0,0,0,5"/>
+                    <CheckBox x:Name="Applications"
+                        Content="Mobile Applications"
+                        Margin="15,5,0,5"/>
+                    <CheckBox x:Name="ApplicationConfigurations"
+                        Content="Application Configurations"
+                        Margin="15,5,0,5"/>
+                    <CheckBox x:Name="ApplicationProtectionPolicies"
+                        Content="Application Protection Policies"
+                        Margin="15,5,0,5"/>
+                </StackPanel>
+            </Border>
+
+            <!-- Device Policies Section -->
+            <Border Grid.Row="6"
+                Background="#F0F0F0"
+                CornerRadius="3"
+                Padding="10"
+                Margin="0,0,0,10">
+                <StackPanel>
+                    <TextBlock Text="Device Policies" FontWeight="SemiBold" Margin="0,0,0,5"/>
+                    <CheckBox x:Name="DeviceCompliancePolicies"
+                        Content="Device Compliance Policies"
+                        Margin="15,5,0,5"/>
+                    <CheckBox x:Name="DeviceConfigurationPolicies"
+                        Content="Device Configuration Policies"
+                        Margin="15,5,0,5"/>
+                </StackPanel>
+            </Border>
+
+            <!-- Scripts Section -->
+            <Border Grid.Row="7"
+                Background="#F0F0F0"
+                CornerRadius="3"
+                Padding="10"
+                Margin="0,0,0,10">
+                <StackPanel>
+                    <TextBlock Text="Scripts &amp; Profiles" FontWeight="SemiBold" Margin="0,0,0,5"/>
+                    <CheckBox x:Name="PlatformScripts"
+                        Content="Platform Scripts (Run Once Scripts)"
+                        Margin="15,5,0,5"/>
+                    <CheckBox x:Name="RemediationScripts"
+                        Content="Remediation Scripts"
+                        Margin="15,5,0,5"/>
+                    <CheckBox x:Name="WindowsAutoPilotProfiles"
+                        Content="Windows AutoPilot Profiles"
+                        Margin="15,5,0,5"/>
+                </StackPanel>
+            </Border>
+
+            <!-- Required Fields Note -->
+            <Border Grid.Row="8"
+                BorderBrush="#CECECE"
+                BorderThickness="0,1,0,0"
+                Margin="0,5,0,5"
+                Padding="0,10,0,0">
+                <TextBlock FontStyle="Italic" HorizontalAlignment="Center">
+                    <Run Text="Fields marked with "/>
+                    <Run Text="*" Foreground="Red"/>
+                    <Run Text=" are required."/>
+                </TextBlock>
+            </Border>
+
+            <!-- Output Location Info -->
+            <Border Grid.Row="9"
+                Background="#F5F5F5"
+                BorderBrush="#E0E0E0"
+                BorderThickness="1"
+                Margin="0,10,0,10"
+                Padding="10">
+                <Grid>
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="Auto"/>
+                        <ColumnDefinition Width="*"/>
+                    </Grid.ColumnDefinitions>
+                    <TextBlock Grid.Column="0" Text="Report will be saved to: " FontWeight="SemiBold"/>
+                    <TextBlock Grid.Column="1" x:Name="OutputPathText" Text="$OutputPath"
+                    TextWrapping="Wrap" Margin="5,0,0,0"/>
+                </Grid>
+            </Border>
+
+            <!-- Button area -->
+            <Grid Grid.Row="10" Margin="0,10,0,0">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="Auto"/>
+                </Grid.ColumnDefinitions>
+
+                <Button x:Name="CancelButton"
+                    Grid.Column="1"
+                    Content="Cancel"
+                    Width="100"
+                    Height="30"
+                    Margin="0,0,10,0"
+                    Background="White"/>
+
+                <Button x:Name="OkButton"
+                    Grid.Column="2"
+                    Content="Generate Report"
+                    Width="150"
+                    Height="30"
+                    Background="$colorBlue"
+                    Foreground="White"
+                    IsDefault="True"/>
+            </Grid>
+        </Grid>
+    </Grid>
+</Window>
+"@
+
+        # Create an empty PSCustomObject to store the results
+        # Status property is included
+        $result = [PSCustomObject]@{
+            GroupName       = $null
+            PoliciesToCheck = @{
+                Applications                  = $false
+                ApplicationConfigurations     = $false
+                ApplicationProtectionPolicies = $false
+                DeviceCompliancePolicies      = $false
+                DeviceConfigurationPolicies   = $false
+                PlatformScripts               = $false
+                RemediationScripts            = $false
+                WindowsAutoPilotProfiles      = $false
+            }
+            Status          = $null  # Will be set to 'Success' or 'Cancelled' based on user action
+        }
+    }
+
+    process {
+        # Load the XAML code into a WPF window
+        $reader = [System.Xml.XmlNodeReader]::new($xaml)
+        try {
+            $window = [Windows.Markup.XamlReader]::Load($reader)
+        }
+        catch {
+            Write-Error "Failed to load XAML: $_"
+            throw 'Unable to create the selection window. Please ensure you have the WPF components installed.'
+        }
+
+        # Set the icon of the window
+        if (Test-Path $iconPath) {
+            $window.Icon = $iconPath
+        }
+
+        # Find the controls in the window for event handling and data binding
+        $textBox = $window.FindName('GroupNameTextBox')
+        $groupNameError = $window.FindName('GroupNameError')
+        $policyTypeError = $window.FindName('PolicyTypeError')
+        $outputPathText = $window.FindName('OutputPathText')
+        $okButton = $window.FindName('OkButton')
+        $cancelButton = $window.FindName('CancelButton')
+
+        # Set the output path display to show where reports will be saved
+        $outputPathText.Text = $OutputPath
+
+        # Find all policy selection checkboxes in the window
+        # These are grouped by category in the UI for better organization
+        $selectAllCheckBox = $window.FindName('SelectAllCheckBox')
+
+        # Application policy checkboxes
+        $applicationsCheckbox = $window.FindName('Applications')
+        $applicationConfigurationsCheckbox = $window.FindName('ApplicationConfigurations')
+        $applicationProtectionPoliciesCheckbox = $window.FindName('ApplicationProtectionPolicies')
+
+        # Device policy checkboxes
+        $deviceCompliancePoliciesCheckbox = $window.FindName('DeviceCompliancePolicies')
+        $deviceConfigurationPoliciesCheckbox = $window.FindName('DeviceConfigurationPolicies')
+
+        # Scripts and profiles checkboxes
+        $platformScriptsCheckbox = $window.FindName('PlatformScripts')
+        $remediationScriptsCheckbox = $window.FindName('RemediationScripts')
+        $windowsAutoPilotProfilesCheckbox = $window.FindName('WindowsAutoPilotProfiles')
+
+        # Add an event handler for the SelectAllCheckBox to improve usability
+        # This allows users to quickly select or deselect all policy types
+        $selectAllCheckBox.Add_Click({
+                try {
+                    # Propagate the SelectAll checkbox state to all policy checkboxes
+                    $isChecked = $selectAllCheckBox.IsChecked
+                    $applicationsCheckbox.IsChecked = $isChecked
+                    $applicationConfigurationsCheckbox.IsChecked = $isChecked
+                    $applicationProtectionPoliciesCheckbox.IsChecked = $isChecked
+                    $deviceCompliancePoliciesCheckbox.IsChecked = $isChecked
+                    $deviceConfigurationPoliciesCheckbox.IsChecked = $isChecked
+                    $platformScriptsCheckbox.IsChecked = $isChecked
+                    $remediationScriptsCheckbox.IsChecked = $isChecked
+                    $windowsAutoPilotProfilesCheckbox.IsChecked = $isChecked
+
+                    # If any checkboxes are selected, clear the policy type error
+                    if ($isChecked) {
+                        $policyTypeError.Visibility = 'Collapsed'
+                    }
+                }
+                catch {
+                    Write-Warning "Error in SelectAll checkbox handler: $_"
+                }
+            })
+
+        # Add an event handler for the OK button to process user input
+        # This performs validation and processes the form when complete
+        $okButton.Add_Click({
+                try {
+                    # Reset error displays for clean validation
+                    $groupNameError.Visibility = 'Collapsed'
+                    $policyTypeError.Visibility = 'Collapsed'
+
+                    # Create array of checkboxes for validation
+                    $checkBoxesArray = @(
+                        $applicationsCheckbox,
+                        $applicationConfigurationsCheckbox,
+                        $applicationProtectionPoliciesCheckbox,
+                        $deviceCompliancePoliciesCheckbox,
+                        $deviceConfigurationPoliciesCheckbox,
+                        $platformScriptsCheckbox,
+                        $remediationScriptsCheckbox,
+                        $windowsAutoPilotProfilesCheckbox
+                    )
+
+                    # Get only the checked checkboxes for validation
+                    $checkedCheckboxes = $checkBoxesArray | Where-Object { $_.IsChecked -eq $true }
+
+                    # Validate required inputs with context-specific error messages
+                    if ([string]::IsNullOrWhiteSpace($textBox.Text)) {
+                        $groupNameError.Text = 'Please enter a security group name'
+                        $groupNameError.Visibility = 'Visible'
+                        $textBox.Focus()
+                        return
+                    }
+                    elseif ($checkedCheckboxes.Count -eq 0) {
+                        $policyTypeError.Visibility = 'Visible'
+                        $selectAllCheckBox.Focus()
+                        return
+                    }
+
+                    # Set DialogResult to true to close the window
+                    $window.DialogResult = $true
+                    $window.Close()
+                }
+                catch {
+                    Write-Warning "Error validating inputs: $_"
+                    $groupNameError.Text = 'An error occurred. Please try again.'
+                    $groupNameError.Visibility = 'Visible'
+                }
+            })
+
+        # Cancel button handler - sets Status explicitly to 'Cancelled'
+        $cancelButton.Add_Click({
+                try {
+                    # Set status to Cancelled explicitly when user cancels
+                    $result.Status = 'Cancelled'
+                    $window.DialogResult = $false
+                    $window.Close()
+                }
+                catch {
+                    Write-Warning "Error canceling dialog: $_"
+                }
+            })
+
+        # Add keyboard event handlers for better accessibility
+        # Escape key closes the form with Cancelled status
+        $window.Add_KeyDown({
+                if ($_.Key -eq [System.Windows.Input.Key]::Escape) {
+                    # Set status to Cancelled explicitly when user presses Escape
+                    $result.Status = 'Cancelled'
+                    $window.DialogResult = $false
+                    $window.Close()
+                }
+            })
+
+        # Focus the textbox when the window is loaded for better usability
+        # This improves keyboard navigation by allowing immediate typing
+        $window.Add_Loaded({
+                try {
+                    $textBox.Focus()
+                }
+                catch {
+                    Write-Warning "Error setting initial focus: $_"
+                }
+            })
+
+        # Show the window and wait for user interaction
+        # This blocks the script until the user makes a selection or cancels
+        $dialogResult = $window.ShowDialog()
+
+        # Process results if dialog was completed successfully
+        if ($dialogResult) {
+            # Set the GroupName property of the result object to the text in the textbox
+            $result.GroupName = ($textBox.Text).Trim()
+            $result.Status = 'Success'
+
+            # Process checkbox selections into the result object
+            if ($selectAllCheckBox.IsChecked -eq $true) {
+                # Special handling for SelectAll - use simplified property
+                # This allows the main script to process all policy types efficiently
+                $result.PoliciesToCheck = @{
+                    All = $true
+                }
+            }
+            else {
+                # Process individual checkbox states into result hashtable
+                $result.PoliciesToCheck['Applications'] = $applicationsCheckbox.IsChecked
+                $result.PoliciesToCheck['ApplicationConfigurations'] = $applicationConfigurationsCheckbox.IsChecked
+                $result.PoliciesToCheck['ApplicationProtectionPolicies'] = $applicationProtectionPoliciesCheckbox.IsChecked
+                $result.PoliciesToCheck['DeviceCompliancePolicies'] = $deviceCompliancePoliciesCheckbox.IsChecked
+                $result.PoliciesToCheck['DeviceConfigurationPolicies'] = $deviceConfigurationPoliciesCheckbox.IsChecked
+                $result.PoliciesToCheck['PlatformScripts'] = $platformScriptsCheckbox.IsChecked
+                $result.PoliciesToCheck['RemediationScripts'] = $remediationScriptsCheckbox.IsChecked
+                $result.PoliciesToCheck['WindowsAutoPilotProfiles'] = $windowsAutoPilotProfilesCheckbox.IsChecked
+            }
+        }
+        else {
+            # Ensure the Status is set to Cancelled if window was closed without explicit cancellation
+            # This handles cases where the window is closed via the X button
+            if ($result.Status -ne 'Cancelled') {
+                $result.Status = 'Cancelled'
+            }
+        }
+    }
+
+    end {
+        # Return the result object regardless of DialogResult
+        # This ensures we always get an object with proper Status
+        [PSCustomObject]$result
+    }
 }
 
+function Get-IntuneDeviceComplianceAssignments {
+    <#
+    .SYNOPSIS
+        Retrieves device compliance policies assigned to a specific security group in Intune.
 
-### Platform Scrips / Device Management 
+    .DESCRIPTION
+        This function uses Microsoft Graph API to retrieve all device compliance policies that are
+        assigned to the specified security group in Microsoft Intune.
 
-$Resource = "deviceManagement/deviceManagementScripts"
-$graphApiVersion = "Beta"
-$uri = "https://graph.microsoft.com/beta/deviceManagement/deviceManagementScripts"
-$PSSC = Invoke-MgGraphRequest -Method GET -Uri $uri
-$AllPSSC = $PSSC.value
-Write-host "Following Platform Scripts / Device Management scripts has been assigned to: $($Group.DisplayName)" -ForegroundColor cyan
+        The function handles three potential scenarios:
+        1. Compliance policies assigned to the group - returns details for each assigned policy
+        2. No compliance policies assigned - returns a "No device compliance policies assigned" object
+        3. Error during retrieval - returns an error object with Status property set to 'Error'
 
-foreach ($Script in $AllPSSC) {
-  
-$SCRIPTAS = (Invoke-MgGraphRequest -Method GET -Uri "https://graph.microsoft.com/beta/deviceManagement/deviceManagementScripts/$($Script.Id)/assignments").value 
+        Device compliance policies define the rules and settings that devices must meet to be
+        considered compliant in Intune. This function retrieves all such policies assigned to
+        the specified group, enabling administrators to review compliance requirements.
 
-  if ($SCRIPTAS.target.groupId -match $Group.Id) {
-  Write-host "$($Script.DisplayName)" -ForegroundColor Yellow
-  }
+    .PARAMETER Group
+        The security group object for which to retrieve assigned device compliance policies.
+        Must be an object of type Microsoft.Graph.PowerShell.Models.MicrosoftGraphGroup.
 
+    .EXAMPLE
+        $group = Get-MgGroup -Filter "displayName eq 'Marketing Department'"
+        Get-IntuneDeviceComplianceAssignments -Group $group
+
+        Retrieves all device compliance policies assigned to the "Marketing Department" group.
+
+    .OUTPUTS
+        System.Collections.Generic.List[PSCustomObject]
+        A list of objects containing:
+        - DisplayName: Name of the assigned compliance policy
+        - LastModified: When the policy was last modified
+        - Status: (Only present on error objects) Set to 'Error' when retrieval fails
+        - Error: (Only present on error objects) The error message
+
+    .NOTES
+        Required Graph API permissions:
+        - DeviceManagementConfiguration.Read.All
+    #>
+
+    [CmdletBinding()]
+    [OutputType([System.Collections.Generic.List[PSCustomObject]])]
+    param (
+        [Parameter(Mandatory = $true)]
+        [Microsoft.Graph.PowerShell.Models.MicrosoftGraphGroup]
+        $Group
+    )
+
+    begin {
+        # Define the Graph API version to use
+        # Beta endpoint is required for compliance policy assignments as of March 2025
+        $graphApiVersion = 'beta'
+
+        # Construct the Graph API endpoint URI for device compliance policies
+        # This endpoint contains all compliance policies that can be assigned to groups
+        $uri = "https://graph.microsoft.com/$graphApiVersion/deviceManagement/deviceCompliancePolicies"
+
+        # Initialize a strongly-typed collection to store results for better performance
+        # This is more efficient than using generic arrays for larger result sets
+        $assignmentList = [System.Collections.Generic.List[PSCustomObject]]::new()
+    }
+
+    process {
+        try {
+            Write-Verbose "Retrieving device compliance policies assigned to group '$($Group.DisplayName)'"
+
+            # Query Graph API for compliance policies with assignment expansion in a single call
+            # Using $expand reduces the number of API calls needed, improving performance
+            $deviceCompliancePoliciesAssignments = (Invoke-MgGraphRequest -Method Get -Uri "$uri/?`$expand=Assignments" -ErrorAction Stop).Value | Where-Object { $_.assignments.target.groupId -match $Group.id }
+
+            # Handle case when no compliance policies are assigned to this group
+            if ($null -eq $deviceCompliancePoliciesAssignments -or $deviceCompliancePoliciesAssignments.Count -eq 0) {
+                # Create a standardized "not found" object
+                # This ensures consistent reporting when no policies are assigned
+                $deviceCompliancePolicyAssignmentObject = [PSCustomObject]@{
+                    DisplayName  = 'No device compliance policies assigned'
+                    LastModified = $null
+                }
+
+                $assignmentList.Add($deviceCompliancePolicyAssignmentObject)
+                Write-Verbose "No device compliance policies found assigned to group '$($Group.DisplayName)'"
+            }
+            else {
+                # Process each device compliance policy assignment found for this group
+                foreach ($assignment in $deviceCompliancePoliciesAssignments) {
+                    # Create a standardized object with consistent property names for reporting
+                    $deviceCompliancePolicyAssignmentObject = [PSCustomObject]@{
+                        DisplayName  = $assignment.DisplayName
+                        LastModified = $assignment.lastModifiedDateTime
+                    }
+
+                    $assignmentList.Add($deviceCompliancePolicyAssignmentObject)
+                }
+
+                Write-Verbose "Retrieved $($deviceCompliancePoliciesAssignments.Count) device compliance policies assigned to group '$($Group.DisplayName)'"
+            }
+        }
+        catch {
+            # Log detailed error information for troubleshooting purposes
+            Write-Error "Failed to retrieve device compliance policy assignments: $_"
+
+            # Create an error object with Status property
+            # This ensures the HTML report can include error information for this section
+            $errorObject = [PSCustomObject]@{
+                DisplayName  = 'Error retrieving device compliance policies'
+                LastModified = Get-Date -Format 'yyyy-MM-dd HH:mm:ss' # Consistent timestamp formatting
+                Status       = 'Error' # Status property for report generation logic
+                Error        = $_.Exception.Message # Original error for troubleshooting
+            }
+
+            $assignmentList.Add($errorObject)
+        }
+    }
+
+    end {
+        # Return the list of assignments
+        $assignmentList
+    }
 }
 
-### Windows Autopilot profiles
+function Get-IntuneDeviceConfigurationAssignments {
+    <#
+    .SYNOPSIS
+        Retrieves device configuration policies assigned to a specific security group in Intune.
 
-$Resource = "deviceManagement/windowsAutopilotDeploymentProfiles"
-$graphApiVersion = "Beta"
-$uri = "https://graph.microsoft.com/$graphApiVersion/$($Resource)?`$expand=Assignments"
-$Response = Invoke-MgGraphRequest -Method GET -Uri $uri
-$AllObjects = $Response.value
-Write-host "Following Autopilot Profiles has been assigned to: $($Group.DisplayName)" -ForegroundColor cyan
+    .DESCRIPTION
+        This function uses Microsoft Graph API to retrieve all device configuration policies that are
+        assigned to the specified security group in Microsoft Intune across different configuration
+        types (device configurations, configuration policies, group policies, mobile app configurations).
 
-foreach ($Script in $AllObjects) {
-  
-$APProfile = (Invoke-MgGraphRequest -Method GET -Uri "https://graph.microsoft.com/beta/deviceManagement/windowsAutopilotDeploymentProfiles/$($Script.Id)/assignments").value 
+        The function handles four distinct policy provider endpoints and supports three scenarios:
+        1. Configuration policies assigned to the group - returns details for each policy by provider type
+        2. No configuration policies assigned - returns "No configuration policies assigned" for each provider
+        3. Error during retrieval - returns an error object with Status property set to 'Error'
 
-  if ($APProfile.target.groupId -match $Group.Id) {
-  Write-host "$($Script.DisplayName)" -ForegroundColor Yellow
-  }
+        Since configuration policies are categorized by different provider types, the function
+        queries multiple Graph API endpoints and includes the provider type in the results to
+        facilitate sorting and grouping in the final report.
 
+    .PARAMETER Group
+        The security group object for which to retrieve assigned device configuration policies.
+        Must be an object of type Microsoft.Graph.PowerShell.Models.MicrosoftGraphGroup.
+
+    .EXAMPLE
+        $group = Get-MgGroup -Filter "displayName eq 'Marketing Department'"
+        Get-IntuneDeviceConfigurationAssignments -Group $group
+
+        Retrieves all device configuration policies assigned to the "Marketing Department" group.
+
+    .OUTPUTS
+        System.Collections.Generic.List[PSCustomObject]
+        A list of objects containing:
+        - ConfigurationPolicyProvider: The provider type (ConfigurationPolicies, DeviceConfigurations, etc.)
+        - DisplayName: Name of the assigned policy
+        - LastModified: When the policy was last modified
+        - Status: (Only present on error objects) Set to 'Error' when retrieval fails
+        - Error: (Only present on error objects) The error message
+
+    .NOTES
+        Required Graph API permissions:
+        - DeviceManagementConfiguration.Read.All
+    #>
+
+    [CmdletBinding()]
+    [OutputType([System.Collections.Generic.List[PSCustomObject]])]
+    param (
+        [Parameter(Mandatory = $true)]
+        [Microsoft.Graph.PowerShell.Models.MicrosoftGraphGroup]
+        $Group
+    )
+
+    begin {
+        # Define the Graph API version to use
+        # Beta endpoint is required for configuration policy assignments as of March 2025
+        $graphApiVersion = 'beta'
+
+        # Set the base URI for the Microsoft Graph API
+        $uri = "https://graph.microsoft.com/$graphApiVersion"
+
+        # Define the endpoints for different types of device configuration policies
+        # Each provider has its own endpoint that must be queried separately
+        $deviceConfigurationPoliciesEndpoints = @{
+            ConfigurationPolicies     = 'deviceManagement/configurationPolicies'            # Settings catalog policies
+            DeviceConfigurations      = 'deviceManagement/deviceConfigurations'             # Traditional device configurations
+            GroupPolicyConfigurations = 'deviceManagement/groupPolicyConfigurations'        # Administrative templates
+            MobileAppConfigurations   = 'deviceAppManagement/mobileAppConfigurations'       # App configurations
+        }
+
+        # Initialize a strongly-typed collection to store results for better performance
+        # This will contain entries from multiple configuration policy providers
+        $assignmentList = [System.Collections.Generic.List[PSCustomObject]]::new()
+    }
+
+    process {
+        try {
+            Write-Verbose "Retrieving device configuration policies assigned to group '$($Group.DisplayName)'"
+
+            # Iterate through each configuration policy provider endpoint
+            foreach ($endpoint in $deviceConfigurationPoliciesEndpoints.GetEnumerator()) {
+                try {
+                    # Construct the full endpoint URI with assignments expansion
+                    $endpointUri = "$uri/$($endpoint.Value)?`$expand=Assignments"
+                    Write-Verbose "Querying endpoint: $endpointUri for provider: $($endpoint.Key)"
+
+                    # Query Graph API in a single call with assignments expanded
+                    $response = Invoke-MgGraphRequest -Method Get -Uri $endpointUri -ErrorAction Stop
+
+                    # Filter the results to only include policies assigned to our target group
+                    $deviceConfigurationPolicyAssignments = $response.Value | Where-Object { $_.assignments.target.groupId -match $Group.id }
+
+                    # If no configuration policies are assigned for this provider/endpoint
+                    if ($null -eq $deviceConfigurationPolicyAssignments -or $deviceConfigurationPolicyAssignments.Count -eq 0) {
+                        # Create a standardized "not found" object for this provider
+                        $deviceConfigurationPolicyAssignmentObject = [PSCustomObject]@{
+                            ConfigurationPolicyProvider = $endpoint.Key
+                            DisplayName                 = "No $($endpoint.Key) configuration policies assigned"
+                            LastModified                = $null
+                        }
+
+                        $assignmentList.Add($deviceConfigurationPolicyAssignmentObject)
+                        Write-Verbose "No $($endpoint.Key) configuration policies assigned to group '$($Group.DisplayName)'"
+                    }
+                    # Process each configuration policy assignment found for this provider
+                    else {
+                        $foundAssignments = $true
+                        foreach ($assignment in $deviceConfigurationPolicyAssignments) {
+                            # Handle special case: ConfigurationPolicies uses Name property instead of DisplayName
+                            if ($null -eq $assignment.DisplayName) {
+                                $deviceConfigurationDisplayName = $assignment.Name
+                            }
+                            else {
+                                $deviceConfigurationDisplayName = $assignment.DisplayName
+                            }
+
+                            # Create a standardized object with provider context for reporting
+                            $deviceConfigurationPolicyAssignmentObject = [PSCustomObject]@{
+                                ConfigurationPolicyProvider = $endpoint.Key
+                                DisplayName                 = $deviceConfigurationDisplayName
+                                LastModified                = $assignment.lastModifiedDateTime
+                            }
+
+                            $assignmentList.Add($deviceConfigurationPolicyAssignmentObject)
+                        }
+
+                        Write-Verbose "Retrieved $($deviceConfigurationPolicyAssignments.Count) $($endpoint.Key) configuration policies assigned to group '$($Group.DisplayName)'"
+                    }
+                }
+                catch {
+                    # Log detailed error information for this specific provider
+                    Write-Error "Failed to retrieve $($endpoint.Key) configuration policy assignments: $_"
+
+                    # Create a provider-specific error object
+                    $errorObject = [PSCustomObject]@{
+                        ConfigurationPolicyProvider = $endpoint.Key
+                        DisplayName                 = "Error retrieving $($endpoint.Key) configuration policies"
+                        LastModified                = Get-Date -Format 'yyyy-MM-dd HH:mm:ss' # # Consistent timestamp formatting
+                        Status                      = 'Error' # Status property for report generation logic
+                        Error                       = $_.Exception.Message
+                    }
+
+                    $assignmentList.Add($errorObject)
+                }
+            }
+
+            # Provide a summary message if no assignments were found across any provider
+            if (-not $foundAssignments) {
+                Write-Verbose "No device configuration policies assigned to group '$($Group.DisplayName)' across any configuration type"
+            }
+        }
+        catch {
+            # Handle any general errors that occur outside the provider-specific processing
+            Write-Error "Failed to process device configuration policy assignments: $_"
+
+            # Create a generic error object when the provider cannot be determined
+            $errorObject = [PSCustomObject]@{
+                ConfigurationPolicyProvider = 'Unknown'
+                DisplayName                 = 'Error retrieving device configuration policies'
+                LastModified                = Get-Date -Format 'yyyy-MM-dd HH:mm:ss' # Consistent timestamp formatting
+                Status                      = 'Error' # Status property for report generation logic
+                Error                       = $_.Exception.Message
+            }
+
+            $assignmentList.Add($errorObject)
+        }
+    }
+
+    end {
+        # Return the list of assignments from all configuration providers
+        # The calling function typically sorts these by provider for better reporting
+        $assignmentList
+    }
 }
 
-Disconnect-Graph
+function Get-IntunePlatformScriptsAssignments {
+    <#
+    .SYNOPSIS
+        Retrieves platform scripts assigned to a specific security group in Intune.
+
+    .DESCRIPTION
+        This function uses Microsoft Graph API to retrieve all platform scripts (also known as run once scripts)
+        that are assigned to the specified security group in Microsoft Intune.
+
+        The function follows a two-step process due to Intune API requirements:
+        1. Retrieve all platform scripts from the tenant
+        2. For each script, query its assignments and check for the target group
+
+        The function handles three scenarios:
+        1. Platform scripts assigned to the group - returns details for each assigned script
+        2. No platform scripts assigned - returns a "No platform scripts assigned" object
+        3. Error during retrieval - returns an error object with Status property set to 'Error'
+
+        Platform scripts are one-time scripts that execute on devices when specific conditions are met.
+
+    .PARAMETER Group
+        The security group object for which to retrieve assigned platform scripts.
+        Must be an object of type Microsoft.Graph.PowerShell.Models.MicrosoftGraphGroup.
+
+    .EXAMPLE
+        $group = Get-MgGroup -Filter "displayName eq 'Marketing Department'"
+        Get-IntunePlatformScriptsAssignments -Group $group
+
+        Retrieves all platform scripts assigned to the "Marketing Department" group.
+
+    .OUTPUTS
+        System.Collections.Generic.List[PSCustomObject]
+        A list of objects containing:
+        - DisplayName: Name of the assigned script
+        - LastModified: When the script was last modified
+        - Status: (Only present on error objects) Set to 'Error' when retrieval fails
+        - Error: (Only present on error objects) The error message
+
+    .NOTES
+        Required Graph API permissions:
+        - DeviceManagementManagedDevices.Read.All
+    #>
+
+    [CmdletBinding()]
+    [OutputType([System.Collections.Generic.List[PSCustomObject]])]
+    param (
+        [Parameter(Mandatory = $true)]
+        [Microsoft.Graph.PowerShell.Models.MicrosoftGraphGroup]
+        $Group
+    )
+
+    begin {
+        # Define the Graph API version to use
+        # Beta endpoint is required for platform scripts as of March 2025
+        $graphApiVersion = 'beta'
+
+        # Set the base URI for the Microsoft Graph API endpoint for platform scripts
+        # Platform scripts are also known as "deviceManagementScripts" in the API
+        $uri = "https://graph.microsoft.com/$graphApiVersion/deviceManagement/deviceManagementScripts"
+
+        # Initialize a strongly-typed collection to store results for better performance
+        $assignmentList = [System.Collections.Generic.List[PSCustomObject]]::new()
+    }
+
+    process {
+        try {
+            Write-Verbose "Retrieving platform scripts assigned to group '$($Group.DisplayName)'"
+
+            # First retrieve all platform scripts in the tenant
+            # Unlike other policy types, platform scripts require retrieving all scripts first
+            $allPlatformScripts = Invoke-MgGraphRequest -Method Get -Uri $uri -ErrorAction Stop
+
+            # Handle case when no platform scripts exist in the tenant at all
+            if ($null -eq $allPlatformScripts.Value -or $allPlatformScripts.Value.Count -eq 0) {
+                $platformScriptAssignmentObject = [PSCustomObject]@{
+                    DisplayName  = 'No platform scripts found in Intune'
+                    LastModified = $null
+                }
+
+                $assignmentList.Add($platformScriptAssignmentObject)
+                Write-Verbose 'No platform scripts found in Intune'
+                return
+            }
+
+            # Iterate through each platform script to check its assignments
+            foreach ($platformScript in $allPlatformScripts.Value) {
+                try {
+                    # For each script, retrieve its assignments by expanding the Assignments property
+                    $scriptUri = "$uri/$($platformScript.Id)?`$expand=Assignments"
+                    Write-Verbose "Checking script assignments: $($platformScript.DisplayName)"
+
+                    # Get the script with its assignments expanded
+                    $scriptWithAssignments = Invoke-MgGraphRequest -Method Get -Uri $scriptUri -ErrorAction Stop
+
+                    # Filter assignments to find matches for our target group
+                    $matchingAssignments = $scriptWithAssignments.assignments | Where-Object { $_.target.groupId -match $Group.id }
+
+                    # If this script is assigned to our target group, add it to results
+                    if ($matchingAssignments) {
+                        $foundAssignments = $true
+                        $platformScriptAssignmentObject = [PSCustomObject]@{
+                            DisplayName  = $platformScript.DisplayName
+                            LastModified = $platformScript.lastModifiedDateTime
+                        }
+
+                        $assignmentList.Add($platformScriptAssignmentObject)
+                        Write-Verbose "Found platform script '$($platformScript.DisplayName)' assigned to group '$($Group.DisplayName)'"
+                    }
+                }
+                catch {
+                    # Handle errors for individual scripts
+                    Write-Error "Failed to check assignments for platform script '$($platformScript.DisplayName)': $_"
+
+                    # Create an error object for this specific script
+                    $errorObject = [PSCustomObject]@{
+                        DisplayName  = "Error checking script: $($platformScript.DisplayName)"
+                        LastModified = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+                        Status       = 'Error' # Status property for report generation logic
+                        Error        = $_.Exception.Message
+                    }
+
+                    $assignmentList.Add($errorObject)
+                }
+            }
+
+            # If no scripts were found to be assigned to this group
+            if (-not $foundAssignments) {
+                $platformScriptAssignmentObject = [PSCustomObject]@{
+                    DisplayName  = 'No platform scripts assigned to this group'
+                    LastModified = $null
+                }
+
+                $assignmentList.Add($platformScriptAssignmentObject)
+                Write-Verbose "No platform scripts found assigned to group '$($Group.DisplayName)'"
+            }
+        }
+        catch {
+            # Handle errors for the overall script retrieval process
+            Write-Error "Failed to retrieve platform script assignments: $_"
+
+            # Create a general error object
+            $errorObject = [PSCustomObject]@{
+                DisplayName  = 'Error retrieving platform scripts'
+                LastModified = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+                Status       = 'Error'
+                Error        = $_.Exception.Message
+            }
+
+            $assignmentList.Add($errorObject)
+        }
+    }
+
+    end {
+        # Return the list of assignments
+        $assignmentList
+    }
+}
+
+function Get-IntuneRemediationScriptsAssignments {
+    <#
+    .SYNOPSIS
+        Retrieves remediation scripts assigned to a specific security group in Intune.
+
+    .DESCRIPTION
+        This function uses Microsoft Graph API to retrieve all remediation scripts (also known as
+        device health scripts) that are assigned to the specified security group in Microsoft Intune.
+
+        The function follows a two-step process similar to platform scripts:
+        1. Retrieve all remediation scripts from the tenant
+        2. For each script, query its assignments and check for the target group
+
+        The function handles three scenarios:
+        1. Remediation scripts assigned to the group - returns details for each assigned script with Status='Assigned'
+        2. No remediation scripts assigned - returns a "No remediation scripts assigned" object with Status='Info'
+        3. Error during retrieval - returns an error object with Status='Error'
+
+        Remediation scripts are proactive scripts that can detect and fix issues on devices automatically
+        through both detection and remediation phases, allowing for monitoring and automatic resolution
+        of common device issues.
+
+    .PARAMETER Group
+        The security group object for which to retrieve assigned remediation scripts.
+        Must be an object of type Microsoft.Graph.PowerShell.Models.MicrosoftGraphGroup.
+
+    .EXAMPLE
+        $group = Get-MgGroup -Filter "displayName eq 'Marketing Department'"
+        Get-IntuneRemediationScriptsAssignments -Group $group
+
+        Retrieves all remediation scripts assigned to the "Marketing Department" group.
+
+    .OUTPUTS
+        System.Collections.Generic.List[PSCustomObject]
+        A list of objects containing:
+        - DisplayName: Name of the assigned remediation script
+        - LastModified: When the script was last modified
+        - Status: One of three values:
+          * 'Assigned' - The script is assigned to the group
+          * 'Info' - Informational message (e.g., no scripts assigned)
+          * 'Error' - An error occurred during retrieval
+        - Error: (Only present on error objects) The error message
+
+    .NOTES
+        Required Graph API permissions:
+        - DeviceManagementManagedDevices.Read.All
+    #>
+
+    [CmdletBinding()]
+    [OutputType([System.Collections.Generic.List[PSCustomObject]])]
+    param (
+        [Parameter(Mandatory = $true)]
+        [Microsoft.Graph.PowerShell.Models.MicrosoftGraphGroup]
+        $Group
+    )
+
+    begin {
+        # Define the Graph API version to use
+        # Beta endpoint is required for remediation scripts as of March 2025
+        $graphApiVersion = 'beta'
+
+        # Set the base URI for the Microsoft Graph API endpoint for device health scripts
+        # Remediation scripts are known as "deviceHealthScripts" in the Graph API
+        $uri = "https://graph.microsoft.com/$graphApiVersion/deviceManagement/deviceHealthScripts"
+
+        # Initialize a strongly-typed collection to store results for better performance
+        $assignmentList = [System.Collections.Generic.List[PSCustomObject]]::new()
+    }
+
+    process {
+        try {
+            Write-Verbose "Retrieving remediation scripts assigned to group '$($Group.DisplayName)'"
+
+            # First retrieve all remediation scripts in the tenant
+            # Unlike some policy types, scripts require retrieving all items first
+            $allRemediationScripts = Invoke-MgGraphRequest -Method Get -Uri $uri -ErrorAction Stop
+
+            # Handle case when no remediation scripts exist in the tenant at all
+            if ($null -eq $allRemediationScripts.Value -or $allRemediationScripts.Value.Count -eq 0) {
+                # Create an info object indicating no remediation scripts exist in the tenant
+                $remediationScriptAssignmentObject = [PSCustomObject]@{
+                    DisplayName  = 'No remediation scripts found in Intune'
+                    LastModified = $null
+                    Status       = 'Info'  # Status property for report generation logic
+                }
+
+                $assignmentList.Add($remediationScriptAssignmentObject)
+                Write-Verbose 'No remediation scripts found in Intune'
+                return
+            }
+
+            # Iterate through each remediation script to check its assignments
+            foreach ($remediationScript in $allRemediationScripts.Value) {
+                try {
+                    # For each script, retrieve its assignments by expanding the Assignments property
+                    $scriptUri = "$uri/$($remediationScript.Id)?`$expand=Assignments"
+                    Write-Verbose "Checking script assignments: $($remediationScript.DisplayName)"
+
+                    # Get the script with its assignments expanded
+                    $scriptWithAssignments = Invoke-MgGraphRequest -Method Get -Uri $scriptUri -ErrorAction Stop
+
+                    # Filter assignments to find matches for our target group
+                    $matchingAssignments = $scriptWithAssignments.assignments | Where-Object { $_.target.groupId -match $Group.id }
+
+                    # If this script is assigned to our target group, add it to results
+                    if ($matchingAssignments) {
+                        $foundAssignments = $true
+                        $remediationScriptAssignmentObject = [PSCustomObject]@{
+                            DisplayName  = $remediationScript.DisplayName
+                            LastModified = $remediationScript.lastModifiedDateTime
+                            Status       = 'Assigned'  # Status property indicates this script is assigned
+                        }
+
+                        $assignmentList.Add($remediationScriptAssignmentObject)
+                        Write-Verbose "Found remediation script '$($remediationScript.DisplayName)' assigned to group '$($Group.DisplayName)'"
+                    }
+                }
+                catch {
+                    # Handle errors for individual scripts
+                    Write-Error "Failed to check assignments for remediation script '$($remediationScript.DisplayName)': $_"
+
+                    # Create an error object for this specific script
+                    $errorObject = [PSCustomObject]@{
+                        DisplayName  = "Error checking script: $($remediationScript.DisplayName)"
+                        LastModified = Get-Date -Format 'yyyy-MM-dd HH:mm:ss' # Consistent timestamp formatting
+                        Status       = 'Error'  # # Status property for report generation logic
+                        Error        = $_.Exception.Message
+                    }
+
+                    $assignmentList.Add($errorObject)
+                }
+            }
+
+            # If no scripts were found to be assigned to this group
+            if (-not $foundAssignments) {
+                # Create an info object indicating no remediation scripts are assigned to this group
+                $remediationScriptAssignmentObject = [PSCustomObject]@{
+                    DisplayName  = 'No remediation scripts assigned to this group'
+                    LastModified = $null
+                    Status       = 'Info'  # Status property for report generation logic
+                }
+
+                $assignmentList.Add($remediationScriptAssignmentObject)
+                Write-Verbose "No remediation scripts found assigned to group '$($Group.DisplayName)'"
+            }
+        }
+        catch {
+            # Handle errors for the overall script retrieval process
+            Write-Error "Failed to retrieve remediation script assignments: $_"
+
+            # Create a general error object
+            $errorObject = [PSCustomObject]@{
+                DisplayName  = 'Error retrieving remediation scripts'
+                LastModified = Get-Date -Format 'yyyy-MM-dd HH:mm:ss' # Consistent timestamp formatting
+                Status       = 'Error'  # Status property for report generation logic
+                Error        = $_.Exception.Message
+            }
+
+            $assignmentList.Add($errorObject)
+        }
+    }
+
+    end {
+        # Return the list of assignments
+        $assignmentList
+    }
+}
+
+function Get-IntuneWindowsAutopilotDeploymentProfilesAssignments {
+    <#
+    .SYNOPSIS
+        Retrieves Windows Autopilot deployment profiles assigned to a specific security group in Intune.
+
+    .DESCRIPTION
+        This function uses Microsoft Graph API to retrieve all Windows Autopilot deployment profiles
+        that are assigned to the specified security group in Microsoft Intune.
+
+        The function follows a two-step process similar to platform scripts:
+        1. Retrieve all Windows Autopilot deployment profiles from the tenant
+        2. For each profile, query its assignments and check for the target group
+
+        The function handles three scenarios:
+        1. Deployment profiles assigned to the group - returns details for each assigned profile with Status='Assigned'
+        2. No deployment profiles assigned - returns a "No profiles assigned" object with Status='Info'
+        3. Error during retrieval - returns an error object with Status='Error'
+
+        Windows Autopilot deployment profiles provide zero-touch device provisioning, configuring how
+        devices are set up during the initial out-of-box-experience (OOBE) phase without manual IT
+        intervention.
+
+    .PARAMETER Group
+        The security group object for which to retrieve assigned deployment profiles.
+        Must be an object of type Microsoft.Graph.PowerShell.Models.MicrosoftGraphGroup.
+
+    .EXAMPLE
+        $group = Get-MgGroup -Filter "displayName eq 'Marketing Department'"
+        Get-IntuneWindowsAutopilotDeploymentProfilesAssignments -Group $group
+
+        Retrieves all Windows Autopilot deployment profiles assigned to the "Marketing Department" group.
+
+    .OUTPUTS
+        System.Collections.Generic.List[PSCustomObject]
+        A list of objects containing:
+        - DisplayName: Name of the assigned deployment profile
+        - LastModified: When the profile was last modified
+        - Status: One of three values:
+          * 'Assigned' - The profile is assigned to the group
+          * 'Info' - Informational message (e.g., no profiles assigned)
+          * 'Error' - An error occurred during retrieval
+        - Error: (Only present on error objects) The error message
+
+    .NOTES
+        Required Graph API permissions:
+        - DeviceManagementServiceConfig.Read.All
+    #>
+
+    [CmdletBinding()]
+    [OutputType([System.Collections.Generic.List[PSCustomObject]])]
+    param (
+        [Parameter(Mandatory = $true)]
+        [Microsoft.Graph.PowerShell.Models.MicrosoftGraphGroup]
+        $Group
+    )
+
+    begin {
+        # Define the Graph API version to use
+        # Beta endpoint is required for Windows Autopilot deployment profiles as of March 2025
+        $graphApiVersion = 'beta'
+
+        # Set the base URI for the Microsoft Graph API endpoint for Windows Autopilot profiles
+        # This endpoint contains all deployment profiles that can be assigned to groups
+        $uri = "https://graph.microsoft.com/$graphApiVersion/deviceManagement/windowsAutopilotDeploymentProfiles"
+
+        # Initialize a strongly-typed collection to store results for better performance
+        $assignmentList = [System.Collections.Generic.List[PSCustomObject]]::new()
+    }
+
+    process {
+        try {
+            Write-Verbose "Retrieving Windows Autopilot deployment profiles assigned to group '$($Group.DisplayName)'"
+
+            # First retrieve all Windows Autopilot deployment profiles in the tenant
+            # Unlike some policy types, profiles require retrieving all items first
+            $allDeploymentProfiles = Invoke-MgGraphRequest -Method Get -Uri $uri -ErrorAction Stop
+
+            # Handle case when no deployment profiles exist in the tenant at all
+            if ($null -eq $allDeploymentProfiles.Value -or $allDeploymentProfiles.Value.Count -eq 0) {
+                # Create an info object indicating no profiles exist in the tenant
+                $deploymentProfileAssignmentObject = [PSCustomObject]@{
+                    DisplayName  = 'No Windows Autopilot deployment profiles found in Intune'
+                    LastModified = $null
+                    Status       = 'Info' # Status property for report generation logic
+                }
+
+                $assignmentList.Add($deploymentProfileAssignmentObject)
+                Write-Verbose 'No Windows Autopilot deployment profiles found in Intune'
+                return
+            }
+
+            # Iterate through each deployment profile to check its assignments
+            foreach ($deploymentProfile in $allDeploymentProfiles.Value) {
+                try {
+                    # For each profile, retrieve its assignments by expanding the Assignments property
+                    $profileUri = "$uri/$($deploymentProfile.Id)?`$expand=Assignments"
+                    Write-Verbose "Checking profile assignments: $($deploymentProfile.DisplayName)"
+
+                    # Get the profile with its assignments expanded
+                    $profileWithAssignments = Invoke-MgGraphRequest -Method Get -Uri $profileUri -ErrorAction Stop
+
+                    # Filter assignments to find matches for our target group
+                    $matchingAssignments = $profileWithAssignments.assignments | Where-Object { $_.target.groupId -match $Group.id }
+
+                    # If this profile is assigned to our target group, add it to results
+                    if ($matchingAssignments) {
+                        $foundAssignments = $true
+                        $deploymentProfileAssignmentObject = [PSCustomObject]@{
+                            DisplayName  = $deploymentProfile.DisplayName
+                            LastModified = $deploymentProfile.lastModifiedDateTime
+                            Status       = 'Assigned' # Status property for report generation logic
+                        }
+
+                        $assignmentList.Add($deploymentProfileAssignmentObject)
+                        Write-Verbose "Found deployment profile '$($deploymentProfile.DisplayName)' assigned to group '$($Group.DisplayName)'"
+                    }
+                }
+                catch {
+                    # Handle errors for individual profiles
+                    Write-Error "Failed to check assignments for deployment profile '$($deploymentProfile.DisplayName)': $_"
+
+                    # Create an error object for this specific profile
+                    $errorObject = [PSCustomObject]@{
+                        DisplayName  = "Error checking profile: $($deploymentProfile.DisplayName)"
+                        LastModified = Get-Date -Format 'yyyy-MM-dd HH:mm:ss' # Consistent timestamp formatting
+                        Status       = 'Error' # Status property for report generation logic
+                        Error        = $_.Exception.Message
+                    }
+
+                    $assignmentList.Add($errorObject)
+                }
+            }
+
+            # If no profiles were found to be assigned to this group
+            if (-not $foundAssignments) {
+                # Create an info object indicating no profiles are assigned to this group
+                $deploymentProfileAssignmentObject = [PSCustomObject]@{
+                    DisplayName  = 'No Windows Autopilot deployment profiles assigned to this group'
+                    LastModified = $null
+                    Status       = 'Info' # Status property for report generation logic
+                }
+
+                $assignmentList.Add($deploymentProfileAssignmentObject)
+                Write-Verbose "No Windows Autopilot deployment profiles found assigned to group '$($Group.DisplayName)'"
+            }
+        }
+        catch {
+            # Handle errors for the overall profile retrieval process
+            Write-Error "Failed to retrieve Windows Autopilot deployment profile assignments: $_"
+
+            # Create a general error object
+            $errorObject = [PSCustomObject]@{
+                DisplayName  = 'Error retrieving Windows Autopilot deployment profiles'
+                LastModified = Get-Date -Format 'yyyy-MM-dd HH:mm:ss' # Consistent timestamp formatting
+                Status       = 'Error' # Status property for report generation logic
+                Error        = $_.Exception.Message
+            }
+
+            $assignmentList.Add($errorObject)
+        }
+    }
+
+    end {
+        # Return the list of assignments
+        $assignmentList
+    }
+}
+
+function New-IntuneAssignmentReport {
+    <#
+    .SYNOPSIS
+        Creates an HTML report for Intune assignments to a security group.
+
+    .DESCRIPTION
+        This function generates a professionally formatted HTML report displaying Intune assignments
+        to a specific security group. The report includes sections for each type of Intune assignment
+        (applications, policies, scripts, etc.) with color-coded status indicators.
+
+        The report features:
+        - Summary statistics cards showing assigned policies, policy types, and errors
+        - Group information including group ID and mail address
+        - Separate tables for each policy type with appropriate columns
+        - Color-coded status indicators for assigned, not found, and error states
+        - Responsive HTML design that works in both light and dark mode email clients
+        - Automatic error highlighting when retrieval issues are detected
+
+        The HTML report uses embedded CSS styling to ensure consistent rendering in email
+        clients and web browsers without requiring external resources.
+
+    .PARAMETER Group
+        The security group object for which the report is being generated.
+        Must be an object of type Microsoft.Graph.PowerShell.Models.MicrosoftGraphGroup.
+
+    .PARAMETER PolicyData
+        A hashtable containing the assignment data for each policy type.
+        The keys should match the policy types (Applications, DeviceCompliancePolicies, etc.).
+        Each value should be a collection of objects with DisplayName, LastModified and optional
+        Status properties.
+
+    .PARAMETER OutputPath
+        The folder path where the HTML report file will be saved.
+        Default is the user's TEMP directory.
+
+    .PARAMETER OpenReport
+        When specified, opens the generated report in the default browser.
+
+    .EXAMPLE
+        New-IntuneAssignmentReport -Group $group -PolicyData $policyData -OutputPath 'C:\Reports' -OpenReport
+
+        Creates an HTML report for the specified group with the policy data and opens it in the default browser.
+        The report will be saved to C:\Reports with a filename based on the group name and current date.
+
+    .OUTPUTS
+        System.String
+        The full path to the generated HTML report file.
+
+    .NOTES
+        The HTML report uses a responsive design that adapts to different screen sizes.
+        Special handling is included for platform-specific policy types that require additional columns.
+    #>
+
+    [CmdletBinding()]
+    [OutputType([System.String])]
+    param (
+        [Parameter(Mandatory = $true)]
+        [Microsoft.Graph.PowerShell.Models.MicrosoftGraphGroup]
+        $Group,
+
+        [Parameter(Mandatory = $true)]
+        [System.Collections.Hashtable]
+        $PolicyData,
+
+        [Parameter(Mandatory = $false)]
+        [string]
+        $OutputPath = "$env:TEMP",
+
+        [Parameter(Mandatory = $false)]
+        [switch]
+        $OpenReport
+    )
+
+    begin {
+        # Initialize brand colors for HTML styling
+        # These colors ensure consistent branding and accessibility in reports
+        $colorBlue = '#007EC3'      # Primary brand color
+        $colorNavy = '#051D2E'      # Dark palette
+        $colorTeal = '#269A91'      # Light palette - for links
+        $colorGoldenrod = '#F1C400' # Light palette - for highlights
+        $colorOrange = '#D45D00'    # Light palette - for warnings/important notes
+        $colorDarkGray = '#3D3936'  # Dark palette
+        $colorMediumGray = '#757982' # Dark palette
+
+        # Color-neutral background and text colors that work in both light and dark mode
+        # These ensure readability regardless of the viewing environment
+        $backgroundColor = '#FFFFFF'     # White background for good contrast
+        $textColor = '#333333'           # Dark gray text that shows well on white
+        $headerBgColor = $colorNavy    # Navy background for headers
+        $headerTextColor = '#FFFFFF'     # White text on navy background
+        $linkColor = $colorTeal        # Teal for links
+        $highlightColor = '#FFF8E0'      # Light yellow highlight that works in both modes
+        $borderColor = '#D0D0D0'         # Light gray borders
+
+        # Create the HTML head section with embedded CSS for email styling
+        # This approach ensures all styling is contained within the HTML file
+        $htmlHeader = @"
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Intune Assignment Report</title>
+    <style>
+        /* Base styles that work in both light and dark mode */
+        body {
+            font-family: Arial, Helvetica, sans-serif;
+            line-height: 1.6;
+            color: $textColor;
+            background-color: $backgroundColor;
+            margin: 0;
+            padding: 20px;
+        }
+
+        .header {
+            background: linear-gradient(to right, $colorBlue, $colorNavy);
+            color: $headerTextColor;
+            padding: 20px;
+            margin-bottom: 20px;
+            border-radius: 4px;
+        }
+
+        .header h1 {
+            margin: 0;
+            font-size: 24px;
+            font-weight: 500;
+        }
+
+        .header p {
+            margin: 5px 0 0 0;
+            font-size: 16px;
+            opacity: 0.9;
+        }
+
+        .content {
+            padding: 0 10px;
+        }
+
+        .section {
+            margin-bottom: 30px;
+        }
+
+        .section h2 {
+            color: $colorBlue;
+            font-size: 18px;
+            margin-top: 25px;
+            margin-bottom: 10px;
+            padding-bottom: 5px;
+            border-bottom: 2px solid $colorBlue;
+        }
+
+        .info {
+            background-color: $highlightColor;
+            border-left: 4px solid $colorGoldenrod;
+            padding: 10px 15px;
+            margin: 15px 0;
+        }
+
+        .warning {
+            background-color: #FFEDE5;
+            border-left: 4px solid $colorOrange;
+            padding: 10px 15px;
+            margin: 15px 0;
+        }
+
+        .error {
+            background-color: #FFE5E5;
+            border-left: 4px solid #E53935;
+            padding: 10px 15px;
+            margin: 15px 0;
+        }
+
+        .success {
+            color: #008000;
+        }
+
+        .warning {
+            color: $colorOrange;
+        }
+
+        .error {
+            color: #ff0000;
+        }
+
+        .info {
+            color: $colorBlue;
+        }
+
+        a {
+            color: $linkColor;
+            text-decoration: underline;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin: 15px 0;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+
+        th {
+            background-color: $colorNavy;
+            color: white;
+            text-align: left;
+            padding: 12px;
+            font-weight: 500;
+            font-size: 12px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        td {
+            padding: 10px 12px;
+            border-bottom: 1px solid $borderColor;
+            vertical-align: top;
+        }
+
+        tr:nth-child(even) {
+            background-color: #f8f8f8;
+        }
+
+        tr:hover {
+            background-color: #f1f1f1;
+        }
+
+        .status-indicator {
+            display: inline-block;
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            margin-right: 6px;
+        }
+
+        .status-error {
+            background-color: #ff0000;
+        }
+
+        .status-assigned {
+            background-color: #008000;
+        }
+
+        .status-info {
+            background-color: $colorBlue;
+        }
+
+        .summary {
+            display: flex;
+            flex-wrap: wrap;
+            margin: 20px 0;
+            gap: 15px;
+        }
+
+        .summary-card {
+            background-color: white;
+            border-radius: 4px;
+            padding: 15px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            flex: 1;
+            min-width: 200px;
+            border-top: 3px solid $colorBlue;
+        }
+
+        .summary-card h3 {
+            margin-top: 0;
+            color: $colorNavy;
+            font-size: 14px;
+            font-weight: 500;
+        }
+
+        .summary-card p {
+            font-size: 24px;
+            font-weight: bold;
+            color: $colorBlue;
+            margin: 5px 0;
+        }
+
+        .summary-card.assigned {
+            border-top-color: #008000;
+        }
+
+        .summary-card.none {
+            border-top-color: $colorMediumGray;
+        }
+
+        .summary-card.error {
+            border-top-color: #ff0000;
+        }
+
+        .footer {
+            margin-top: 30px;
+            padding-top: 15px;
+            border-top: 1px solid $borderColor;
+            font-style: italic;
+            font-size: 14px;
+            color: #777777;
+            text-align: center;
+        }
+
+        /* Force dark mode email clients to respect our light theme */
+        @media (prefers-color-scheme: dark) {
+            body {
+                color: $textColor !important;
+                background-color: $backgroundColor !important;
+            }
+
+            .section h2 {
+                color: $colorBlue !important;
+            }
+
+            .warning {
+                color: $colorOrange !important;
+            }
+
+            a {
+                color: $linkColor !important;
+            }
+        }
+    </style>
+</head>
+"@
+
+        # Format date for output filename using standardized date format
+        $dateStamp = Get-Date -Format 'yyyy-MM-dd'
+    }
+
+    process {
+        Write-Verbose "Generating HTML report for group '$($Group.DisplayName)'"
+
+        # Process the data first to get accurate counts for summary cards
+        # These statistics provide an at-a-glance overview of the report
+        $totalPoliciesChecked = 0
+        $totalAssignedItems = 0
+        $totalErrorItems = 0
+
+        # Pre-process data to calculate accurate statistics
+        foreach ($policyType in $PolicyData.Keys) {
+            if ($null -ne $PolicyData[$policyType] -and $PolicyData[$policyType].Count -gt 0) {
+                $totalPoliciesChecked++
+
+                # Count errors - these will be highlighted in the error summary card
+                $errorItems = $PolicyData[$policyType] | Where-Object { $_.Status -eq 'Error' }
+                if ($errorItems) {
+                    $totalErrorItems += $errorItems.Count
+                }
+
+                # Count assigned items (excluding errors and "No X assigned" entries)
+                # This gives an accurate count of actual assignments rather than entries
+                $assignedItems = $PolicyData[$policyType] | Where-Object {
+                    (-not $_.DisplayName.StartsWith('No ')) -and (-not $_.DisplayName.StartsWith('Error ')) -and $_.Status -ne 'Error'
+                }
+
+                if ($assignedItems) {
+                    $totalAssignedItems += $assignedItems.Count
+                }
+            }
+        }
+
+        # Build the HTML body with consistent styling
+        # Start with header and summary statistics
+        $htmlBody = @"
+$htmlHeader
+<body>
+    <div class="header">
+        <h1>Intune Assignment Report</h1>
+        <p>Security Group: $($Group.DisplayName)</p>
+    </div>
+
+    <div class="content">
+        <div class="summary">
+            <div class="summary-card assigned">
+                <h3>ASSIGNED POLICIES</h3>
+                <p>$totalAssignedItems</p>
+            </div>
+            <div class="summary-card">
+                <h3>POLICY TYPES CHECKED</h3>
+                <p>$totalPoliciesChecked</p>
+            </div>
+            <div class="summary-card$(if($totalErrorItems -gt 0){' error'})">
+                <h3>ERRORS</h3>
+                <p>$totalErrorItems</p>
+            </div>
+        </div>
+
+        <div class="info">
+            <strong>Report Generated:</strong> $(Get-Date -Format 'MMMM d, yyyy HH:mm:ss')<br>
+            <strong>Group ID:</strong> $($Group.Id)<br>
+            <strong>Mail Address:</strong> $(if($Group.Mail){$Group.Mail}else{'Not configured'})
+        </div>
+"@
+
+        # Create a section for each policy type that has data
+        # This ensures the report is organized by policy categories
+        foreach ($policyType in $PolicyData.Keys) {
+            if ($null -ne $PolicyData[$policyType] -and $PolicyData[$policyType].Count -gt 0) {
+                # Create a friendly name for the section header based on policy type
+                # This makes the report more readable than using internal names
+                $sectionName = switch ($policyType) {
+                    'ApplicationAssignments' { 'Application Assignments' }
+                    'ApplicationConfigurationsAssignments' { 'Application Configuration Assignments' }
+                    'ApplicationProtectionAssignments' { 'Application Protection Policy Assignments' }
+                    'DeviceComplianceAssignments' { 'Device Compliance Policy Assignments' }
+                    'DeviceConfigurationAssignments' { 'Device Configuration Policy Assignments' }
+                    'PlatformScriptsAssignments' { 'Platform Script Assignments' }
+                    'RemediationScriptsAssignments' { 'Remediation Script Assignments' }
+                    'WindowsAutoPilotProfilesAssignments' { 'Windows AutoPilot Profile Assignments' }
+                    default { $policyType }
+                }
+
+                $htmlBody += @"
+        <div class="section">
+            <h2>$sectionName</h2>
+"@
+
+                # Check if any errors exist in this policy type and display a warning banner
+                # This helps draw attention to sections with retrieval problems
+                $errorItems = $PolicyData[$policyType] | Where-Object { $_.Status -eq 'Error' }
+                if ($errorItems -and $errorItems.Count -gt 0) {
+                    $htmlBody += @'
+            <div class="error">
+                <strong>Error:</strong> Some items could not be retrieved. Please check the report details.
+            </div>
+'@
+                }
+
+                # Create table with appropriate columns based on policy type
+                $htmlBody += @'
+            <table>
+                <thead>
+                    <tr>
+'@
+
+                # Determine which columns to show based on the policy type
+                # Some policy types require additional columns to display complete information
+                if ($policyType -eq 'ApplicationProtectionAssignments') {
+                    $htmlBody += @'
+                        <th>Platform</th>
+                        <th>Display Name</th>
+                        <th>Last Modified</th>
+                        <th>Status</th>
+'@
+                }
+                elseif ($policyType -eq 'DeviceConfigurationAssignments') {
+                    $htmlBody += @'
+                        <th>Configuration Type</th>
+                        <th>Display Name</th>
+                        <th>Last Modified</th>
+                        <th>Status</th>
+'@
+                }
+                else {
+                    $htmlBody += @'
+                        <th>Display Name</th>
+                        <th>Last Modified</th>
+                        <th>Status</th>
+'@
+                }
+
+                $htmlBody += @'
+                    </tr>
+                </thead>
+                <tbody>
+'@
+
+                # Add rows for each item in this policy type
+                foreach ($item in $PolicyData[$policyType]) {
+                    $status = 'Info'
+                    $statusDisplay = ''
+
+                    # Determine the status display with appropriate visual indicators
+                    # This creates consistent visual status representations across policy types
+                    if ($item.Status -eq 'Error') {
+                        $status = 'error'
+                        $statusDisplay = "<span class='status-indicator status-error'></span>Error"
+                    }
+                    elseif ($item.Status -eq 'Assigned') {
+                        $status = 'assigned'
+                        $statusDisplay = "<span class='status-indicator status-assigned'></span>Assigned"
+                    }
+                    elseif ($item.DisplayName -like '*No*assigned*') {
+                        $status = 'info'
+                        $statusDisplay = "<span class='status-indicator status-info'></span>None Found"
+                    }
+                    else {
+                        $status = 'assigned'
+                        $statusDisplay = "<span class='status-indicator status-assigned'></span>Assigned"
+                    }
+
+                    # Format the row based on policy type
+                    $htmlBody += @'
+                    <tr>
+'@
+
+                    # Add the appropriate columns based on policy type
+                    # Different policy types require different properties to be displayed
+                    if ($policyType -eq 'ApplicationProtectionAssignments') {
+                        $htmlBody += @"
+                        <td>$($item.ApplicationProtectionPolicyPlatform)</td>
+                        <td>$($item.DisplayName)</td>
+                        <td>$(if($item.LastModified){Get-Date $item.LastModified -Format 'yyyy-MM-dd HH:mm:ss'}else{'N/A'})</td>
+                        <td>$statusDisplay</td>
+"@
+                    }
+                    elseif ($policyType -eq 'DeviceConfigurationAssignments') {
+                        $htmlBody += @"
+                        <td>$($item.ConfigurationPolicyProvider)</td>
+                        <td>$($item.DisplayName)</td>
+                        <td>$(if($item.LastModified){Get-Date $item.LastModified -Format 'yyyy-MM-dd HH:mm:ss'}else{'N/A'})</td>
+                        <td>$statusDisplay</td>
+"@
+                    }
+                    else {
+                        $htmlBody += @"
+                        <td>$($item.DisplayName)</td>
+                        <td>$(if($item.LastModified){Get-Date $item.LastModified -Format 'yyyy-MM-dd HH:mm:ss'}else{'N/A'})</td>
+                        <td>$statusDisplay</td>
+"@
+                    }
+
+                    $htmlBody += @'
+                    </tr>
+'@
+                }
+
+                $htmlBody += @'
+                </tbody>
+            </table>
+        </div>
+'@
+            }
+        }
+
+        # Add footer with generation information for audit purposes
+        $htmlBody += @"
+        <div class="footer">
+            This report was generated by $(Split-Path -Path $MyInvocation.ScriptName -Leaf) on $(Get-Date -Format 'yyyy-MM-dd') at $(Get-Date -Format 'HH:mm:ss')<br>
+            Running from $($env:COMPUTERNAME) by $($env:USERNAME)
+        </div>
+    </div>
+</body>
+</html>
+"@
+
+        # Create a sanitized filename by removing invalid file characters
+        # This ensures the report can be saved without path/filename issues
+        $sanitizedGroupName = $Group.DisplayName -replace '[\\\/\:\*\?\"\<\>\|]', '_'
+        $htmlFileName = Join-Path -Path $OutputPath -ChildPath "IntuneAssignments_${sanitizedGroupName}_${dateStamp}.html"
+
+        # Save the HTML to file
+        $htmlBody | Out-File -FilePath $htmlFileName -Force
+
+        Write-Verbose "HTML report saved to: $htmlFileName"
+
+        # Open the report if requested using the default browser
+        if ($OpenReport) {
+            Invoke-Item $htmlFileName
+        }
+    }
+
+    end {
+        # Return the path to the generated report
+        # This allows calling scripts to use the path for further processing
+        $htmlFileName
+    }
+}
+
+function New-MgGraphConnection {
+    <#
+    .SYNOPSIS
+        Connects to Microsoft Graph API using certificate-based authentication.
+
+    .DESCRIPTION
+        Establishes a connection to Microsoft Graph API using certificate-based authentication with
+        appropriate credentials for either development or production environment. The function will
+        reconnect if connected with the wrong client ID.
+
+    .PARAMETER DevelopmentMode
+        Specifies whether to use development certificate. Default is $false.
+
+    .PARAMETER UseLogging
+        Specifies whether to use the Write-Log function for logging. Default is $false.
+
+    .EXAMPLE
+        New-MgGraphConnection
+        Connects to Microsoft Graph API in production mode without logging.
+
+    .EXAMPLE
+        New-MgGraphConnection -DevelopmentMode
+        Connects to Microsoft Graph API in development mode without logging.
+
+    .EXAMPLE
+        New-MgGraphConnection -UseLogging
+        Connects to Microsoft Graph API in production mode with logging.
+
+    .OUTPUTS
+        [PSCustomObject]
+        Returns a custom object with Status property indicating Success or Error.
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    [OutputType([PSCustomObject])]
+    param (
+        [Parameter(Mandatory = $false)]
+        [switch]
+        $DevelopmentMode,
+
+        [Parameter(Mandatory = $false)]
+        [switch]
+        $UseLogging
+    )
+    begin {
+        # Application and tenant identifiers
+        $entraAppId = '14d82eec-204b-4c2f-b7e8-296a70dab67e'
+    }
+
+    process {
+        # Establish connection to Microsoft Graph API
+        try {
+            $params = @{
+                Scopes      = @(
+                    'Group.Read.All',
+                    'DeviceManagementManagedDevices.Read.All',
+                    'DeviceManagementServiceConfig.Read.All',
+                    'DeviceManagementApps.Read.All',
+                    'DeviceManagementConfiguration.Read.All'
+                )
+                NoWelcome   = $true
+                ErrorAction = 'Stop'
+            }
+
+            $currentContext = Get-MgContext
+
+            if ($null -eq $currentContext) {
+                if ($PSBoundParameters.ContainsKey('UseLogging')) {
+                    Write-Log -Message 'Connecting to Microsoft Graph API' -Severity Info -Component $MyInvocation.MyCommand.Name
+                }
+                else {
+                    Write-Verbose 'Connecting to Microsoft Graph API'
+                }
+
+                if ($PSCmdlet.ShouldProcess('Microsoft Graph API', 'Connect')) {
+                    $mgContext = Connect-MgGraph @params
+                }
+            }
+            # Reconnect if connected with a different client ID
+            elseif ($currentContext.ClientId -ne $entraAppId) {
+                if ($PSCmdlet.ShouldProcess('Microsoft Graph API', 'Disconnect and reconnect')) {
+                    if ($PSBoundParameters.ContainsKey('UseLogging')) {
+                        Write-Log -Message 'Reconnecting to Microsoft Graph API with correct application ID' -Severity Info -Component $MyInvocation.MyCommand.Name
+                    }
+                    else {
+                        Write-Verbose 'Reconnecting to Microsoft Graph API with correct application ID'
+                    }
+
+                    [void](Disconnect-MgGraph -ErrorAction Stop)
+                    $mgContext = Connect-MgGraph @params
+                }
+            }
+            else {
+                if ($PSBoundParameters.ContainsKey('UseLogging')) {
+                    Write-Log -Message 'Already connected to Microsoft Graph API' -Severity Info -Component $MyInvocation.MyCommand.Name
+                }
+                else {
+                    Write-Verbose 'Already connected to Microsoft Graph API'
+                }
+
+                $mgContext = $currentContext
+            }
+
+            # Return a success object with the connection context
+            [PSCustomObject]@{
+                Status  = 'Success'
+                Message = 'Successfully connected to Microsoft Graph API'
+                Context = $mgContext
+            }
+        }
+        catch {
+            $errorMessage = "Failed to connect to Microsoft Graph: $($_.Exception.Message)"
+            if ($PSBoundParameters.ContainsKey('UseLogging')) {
+                Write-Log -Message $errorMessage -Severity Error -Component $MyInvocation.MyCommand.Name
+            }
+            else {
+                Write-Verbose $errorMessage
+            }
+
+            # Return a custom error object instead of terminating
+            [PSCustomObject]@{
+                Status    = 'Error'
+                Message   = $errorMessage
+                Exception = $_.Exception
+            }
+        }
+    }
+}
+
+# Load the WPF assembly required for the selection form UI
+Add-Type -AssemblyName PresentationFramework
+
+$graphConnection = New-MgGraphConnection -DevelopmentMode:$DevelopmentMode
+
+# Check if the connection was successful
+if ($graphConnection.Status -eq 'Error') {
+    Write-Log -Message "Critical error: $($graphConnection.Message)" -Severity Error -Component $scriptName
+    exit 1
+}
+
+# Ensure the output directory exists before attempting to save reports
+# This prevents errors when trying to save to a non-existent location
+if (-Not (Test-Path $htmlSavePath)) {
+    New-Item -ItemType Directory -Path $htmlSavePath -Force | Out-Null
+    Write-Verbose "Created directory: $htmlSavePath"
+}
+
+# Display the selection form to get user input for security group and policy types
+# This returns a custom object with GroupName, PoliciesToCheck, and Status properties
+$selection = Get-IntuneAssignmentSelectionForm -OutputPath $HtmlSavePath
+
+# Handle user cancellation by exiting the script gracefully
+# This provides a clean exit point when the user cancels the operation
+if ($selection.Status -eq 'Cancelled') {
+    Write-Warning 'Operation cancelled by user.'
+    return
+}
+
+# Provide feedback to the user that data retrieval is in progress
+# This helps set expectations for potentially lengthy operations
+Write-Host "Please wait while retrieving Intune assignment data for group '$($selection.GroupName)'..." -ForegroundColor Cyan
+
+# Handle special characters in group names for proper filtering
+# Single quotes in group names need special handling in ODATA filters
+if ($selection.GroupName -match "'") {
+    $queryGroupName = $selection.GroupName -replace "'", "''"
+}
+else {
+    $queryGroupName = $selection.GroupName
+}
+
+# Retrieve the security group object using Microsoft Graph
+# This object is needed for all subsequent assignment queries
+Write-Verbose "Retrieving group information for '$($selection.GroupName)'"
+$group = Get-MgGroup -Filter "DisplayName eq '$queryGroupName'"
+
+# Validate group existence before proceeding with assignment checks
+# Providing a clear error for non-existent groups prevents confusing results
+if ($null -eq $group) {
+    throw "Group `"$($selection.GroupName)`" not found. Please enter a valid group name."
+}
+
+# Initialize a hashtable to store policy data from all selected policy types
+# This will be passed to the report generator to create the HTML report
+$policyData = @{}
+
+# Get only the policies that were selected by the user in the form
+# Filters the hashtable to include only true (selected) values
+$policiesToCheck = $selection.PoliciesToCheck.GetEnumerator() | Where-Object { $_.Value -eq $true }
+
+# Handle the special "All" case which selects all policy types
+# This simplifies user experience by allowing a single click to select everything
+if ($policiesToCheck.Name -eq 'All') {
+    Write-Verbose "Retrieving all policy types for group '$($group.DisplayName)'"
+
+    # Applications - Mobile apps assigned to the group
+    $policyData['ApplicationAssignments'] = Get-IntuneApplicationAssignments -Group $group
+
+    # Application Configurations - Settings applied to applications
+    $policyData['ApplicationConfigurationsAssignments'] = Get-IntuneApplicationConfigurationAssignments -Group $group
+
+    # Application Protection Policies - Data protection policies for apps
+    # Sort by platform type to group Android, iOS and Windows policies together
+    $appProtectionPolicies = Get-IntuneApplicationProtectionAssignments -Group $group
+    $policyData['ApplicationProtectionAssignments'] = $appProtectionPolicies | Sort-Object -Property ApplicationProtectionPolicyPlatform
+
+    # Device Compliance Policies - Rules that devices must meet
+    $policyData['DeviceComplianceAssignments'] = Get-IntuneDeviceComplianceAssignments -Group $group
+
+    # Device Configuration Policies - Settings enforced on devices
+    # Sort by provider type to group configuration types together
+    $deviceConfigPolicies = Get-IntuneDeviceConfigurationAssignments -Group $group
+    $policyData['DeviceConfigurationAssignments'] = $deviceConfigPolicies | Sort-Object -Property ConfigurationPolicyProvider
+
+    # Platform Scripts - One-time PowerShell scripts
+    $policyData['PlatformScriptsAssignments'] = Get-IntunePlatformScriptsAssignments -Group $group
+
+    # Remediation Scripts - Scripts that detect and fix issues
+    $policyData['RemediationScriptsAssignments'] = Get-IntuneRemediationScriptsAssignments -Group $group
+
+    # Windows AutoPilot Profiles - Device provisioning configurations
+    $policyData['WindowsAutoPilotProfilesAssignments'] = Get-IntuneWindowsAutopilotDeploymentProfilesAssignments -Group $group
+}
+# Process individual policy type selections when "All" is not selected
+# This allows for targeted reports covering only specific policy types
+else {
+    Write-Verbose "Checking selected policy types for group '$($group.DisplayName)'"
+
+    # Process each selected policy type using a switch for clear organization
+    foreach ($policy in $policiesToCheck) {
+        switch ($policy.Key) {
+            'Applications' {
+                $policyData['ApplicationAssignments'] = Get-IntuneApplicationAssignments -Group $group
+            }
+            'ApplicationConfigurations' {
+                $policyData['ApplicationConfigurationsAssignments'] = Get-IntuneApplicationConfigurationAssignments -Group $group
+            }
+            'ApplicationProtectionPolicies' {
+                $appProtectionPolicies = Get-IntuneApplicationProtectionAssignments -Group $group
+                $policyData['ApplicationProtectionAssignments'] = $appProtectionPolicies | Sort-Object -Property ApplicationProtectionPolicyPlatform
+            }
+            'DeviceCompliancePolicies' {
+                $policyData['DeviceComplianceAssignments'] = Get-IntuneDeviceComplianceAssignments -Group $group
+            }
+            'DeviceConfigurationPolicies' {
+                $deviceConfigPolicies = Get-IntuneDeviceConfigurationAssignments -Group $group
+                $policyData['DeviceConfigurationAssignments'] = $deviceConfigPolicies | Sort-Object -Property ConfigurationPolicyProvider
+            }
+            'PlatformScripts' {
+                $policyData['PlatformScriptsAssignments'] = Get-IntunePlatformScriptsAssignments -Group $group
+            }
+            'RemediationScripts' {
+                $policyData['RemediationScriptsAssignments'] = Get-IntuneRemediationScriptsAssignments -Group $group
+            }
+            'WindowsAutoPilotProfiles' {
+                $policyData['WindowsAutoPilotProfilesAssignments'] = Get-IntuneWindowsAutopilotDeploymentProfilesAssignments -Group $group
+            }
+        }
+    }
+}
+
+# Generate the HTML report with all collected policy data and open it automatically
+# This provides immediate results to the user after data collection completes
+New-IntuneAssignmentReport -Group $group -PolicyData $policyData -OutputPath $htmlSavePath -OpenReport
+
+# Gracefully disconnect from the Microsoft Graph API when complete
+[void](Disconnect-MgGraph)
